@@ -9,7 +9,7 @@ fn main() -> Result<()> {
 
     let model_dir = "model/qwen-0.5b";
     let device = Device::Cpu;
-    let max_new_tokens = 40;
+    let max_new_tokens = 60;
 
     let config: Config = serde_json::from_str(
         &std::fs::read_to_string(format!("{}/config.json", model_dir))?
@@ -25,7 +25,6 @@ fn main() -> Result<()> {
 
     let mut model = Qwen2Model::new(&config, vb)?;
 
-    // Загружаем веса эмбеддингов с явной формой
     let vb_embed = unsafe {
         VarBuilder::from_mmaped_safetensors(&[safetensors_path], DType::F32, &device)?
     };
@@ -35,8 +34,15 @@ fn main() -> Result<()> {
 
     println!("Model loaded successfully!");
 
-    let prompt = "Hello, world!";
-    println!("Prompt: {}", prompt);
+    // ===================== ЧАТ-ШАБЛОН QWEN (вручную) =====================
+    let prompt = r#"<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Hello, world!<|im_end|>
+<|im_start|>assistant
+"#;
+
+    println!("Formatted prompt:\n{}", prompt);
 
     let encoding = tokenizer.encode(prompt, true)
         .map_err(|e| anyhow::anyhow!("Encode error: {}", e))?;
@@ -71,6 +77,6 @@ fn main() -> Result<()> {
     let generated_text = tokenizer.decode(&tokens, true)
         .map_err(|e| anyhow::anyhow!("Decode error: {}", e))?;
 
-    println!("Generated: {}", generated_text);
+    println!("\nGenerated:\n{}", generated_text);
     Ok(())
 }

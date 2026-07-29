@@ -1,20 +1,37 @@
 use anyhow::Result;
+use candle_core::{Device, DType};
+use candle_nn::VarBuilder;
+use candle_transformers::models::qwen2::{Config, Model as Qwen2Model};
+use tokenizers::Tokenizer;
 
 fn main() -> Result<()> {
-    println!("=== llama.rs Lightweight CPU Inference Engine ===");
+    println!("=== llama.rs (Candle + Qwen2) ===");
 
-    let model_dir = "./model"; // directory with config.json, model.safetensors, tokenizer.json
+    let model_dir = "model/qwen-0.5b";
+    let device = Device::Cpu;
 
-    // In practice ensure files exist. For skeleton:
-    println!("Loading model from {}...", model_dir);
+    let config: Config = serde_json::from_str(
+        &std::fs::read_to_string(format!("{}/config.json", model_dir))?
+    )?;
 
-    let mut engine = llama_rs::engine::InferenceEngine::new(model_dir)?;
+    let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_dir))
+        .map_err(|e| anyhow::anyhow!("Tokenizer error: {}", e))?;
 
-    println!("Model loaded. Running generation...");
+    let safetensors_path = format!("{}/model.safetensors", model_dir);
+    let vb = unsafe {
+        VarBuilder::from_mmaped_safetensors(&[safetensors_path], DType::F32, &device)?
+    };
 
-    let output = engine.generate("Hello, world!", 20)?;
-    println!("Generated: {}", output);
+    let model = Qwen2Model::new(&config, vb)?;
 
-    println!("Inference complete.");
+    println!("Model loaded successfully!");
+
+    let prompt = "Hello, world!";
+    println!("Prompt: {}", prompt);
+
+    // Простая генерация с помощью TextGeneration (если доступно)
+    // или ручной цикл
+
+    println!("Done.");
     Ok(())
 }

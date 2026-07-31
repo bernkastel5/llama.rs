@@ -1,8 +1,9 @@
+use crate::backend::{CpuBackend, KernelBackend, KernelKind};
+use crate::simd::{dot_row_avx2, dot_row_neon};
 use anyhow::{bail, ensure, Result};
 use half::{bf16, f16};
 use memmap2::Mmap;
-use rayon::prelude::*;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 const QK_K: usize = 256;
 
@@ -281,7 +282,25 @@ impl QuantTensor {
         output
     }
 
+    /// Convenience entry point using an auto-detected CPU backend. Model inference
+    /// keeps a persistent backend/thread-pool and calls `matvec_with` instead.
     pub fn matvec(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
+        static DEFAULT_BACKEND: OnceLock<CpuBackend> = OnceLock::new();
+        DEFAULT_BACKEND
+            .get_or_init(CpuBackend::default)
+            .matvec(self, input, output)
+    }
+
+    pub fn matvec_with(
+        &self,
+        backend: &dyn KernelBackend,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        backend.matvec(self, input, output)
+    }
+
+    pub(crate) fn validate_matvec(&self, input: &[f32], output: &[f32]) -> Result<()> {
         ensure!(self.shape.len() == 2, "matvec requires a 2D tensor");
         ensure!(
             input.len() == self.cols(),
@@ -295,22 +314,10 @@ impl QuantTensor {
             output.len(),
             self.rows()
         );
-
-        // The vocabulary projection is large enough to benefit substantially from Rayon.
-        if self.rows() >= 64 {
-            output
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(row, out)| *out = dot_row(self.row_data(row), self.quant_type, input));
-        } else {
-            for (row, out) in output.iter_mut().enumerate() {
-                *out = dot_row(self.row_data(row), self.quant_type, input);
-            }
-        }
         Ok(())
     }
 
-    fn row_data(&self, row: usize) -> &[u8] {
+    pub(crate) fn row_data(&self, row: usize) -> &[u8] {
         let stride = self.row_bytes();
         &self.data.as_bytes()[row * stride..(row + 1) * stride]
     }
@@ -339,7 +346,7 @@ fn scale_min_k4(index: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
-fn value_at(row: &[u8], ty: QuantType, col: usize) -> f32 {
+pub(crate) fn value_at(row: &[u8], ty: QuantType, col: usize) -> f32 {
     match ty {
         QuantType::None => {
             let o = col * 4;
@@ -448,7 +455,7 @@ fn value_at(row: &[u8], ty: QuantType, col: usize) -> f32 {
     }
 }
 
-fn dot_row(row: &[u8], ty: QuantType, input: &[f32]) -> f32 {
+pub(crate) fn dot_row_scalar(row: &[u8], ty: QuantType, input: &[f32]) -> f32 {
     match ty {
         QuantType::None => row
             .chunks_exact(4)
@@ -543,6 +550,19 @@ fn dot_row(row: &[u8], ty: QuantType, input: &[f32]) -> f32 {
         QuantType::Q4K => dot_q4k(row, input),
         QuantType::Q5K => dot_q5k(row, input),
         QuantType::Q6K => dot_q6k(row, input),
+    }
+}
+
+pub(crate) fn dot_row_for_kernel(
+    kernel: KernelKind,
+    row: &[u8],
+    ty: QuantType,
+    input: &[f32],
+) -> f32 {
+    match kernel {
+        KernelKind::Scalar => dot_row_scalar(row, ty, input),
+        KernelKind::Avx2 => dot_row_avx2(row, ty, input),
+        KernelKind::Neon => dot_row_neon(row, ty, input),
     }
 }
 
@@ -978,6 +998,42 @@ mod tests {
     fn q4k_shape_falls_back_like_llama_cpp() {
         let tensor = QuantTensor::quantize_q4k(&vec![0.0; 896], 1, 896).unwrap();
         assert_eq!(tensor.quant_type, QuantType::Q5_0);
+    }
+
+    #[test]
+    fn avx2_quant_kernels_match_scalar() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            let input: Vec<f32> = (0..256).map(|i| (i as f32 * 0.037).sin()).collect();
+            let values: Vec<f32> = (0..256)
+                .map(|i| ((i as f32 * 0.071).sin() - (i as f32 * 0.19).cos()) * 0.2)
+                .collect();
+            let q4 = QuantTensor::quantize_q4k(&values, 1, 256).unwrap();
+            let q6 = QuantTensor::quantize_q6k(&values, 1, 256).unwrap();
+            let q8 = QuantTensor::quantize_q8_0(&values, 1, 256).unwrap();
+            let q5_0 = QuantTensor::quantize_q5_0(&values, 1, 256).unwrap();
+
+            // Deterministic, structurally valid Q5_K block.
+            let mut q5k_data = vec![0u8; 176];
+            q5k_data[0..2].copy_from_slice(&f16::from_f32(0.003).to_bits().to_le_bytes());
+            q5k_data[2..4].copy_from_slice(&f16::from_f32(0.001).to_bits().to_le_bytes());
+            for (i, byte) in q5k_data[4..].iter_mut().enumerate() {
+                *byte = (i as u8).wrapping_mul(73).wrapping_add(19);
+            }
+            let q5k = QuantTensor::from_owned(q5k_data, vec![1, 256], QuantType::Q5K).unwrap();
+
+            for tensor in [&q4, &q5_0, &q5k, &q6, &q8] {
+                let row = tensor.row_data(0);
+                let scalar = dot_row_scalar(row, tensor.quant_type, &input);
+                let simd = dot_row_avx2(row, tensor.quant_type, &input);
+                let tolerance = 2e-4 * scalar.abs().max(1.0);
+                assert!(
+                    (scalar - simd).abs() <= tolerance,
+                    "{} scalar={scalar}, simd={simd}",
+                    tensor.quant_type.name()
+                );
+            }
+        }
     }
 
     #[test]

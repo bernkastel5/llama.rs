@@ -1,9 +1,11 @@
+use crate::architecture::{CausalModel, LogitsMode};
+use crate::benchmark::{GenerationOutput, InferenceMetrics};
 use crate::cache::{InferenceBuffers, KVCache};
 use crate::loader::{LoadOptions, ModelLoader};
-use crate::model::LlamaModel;
 use anyhow::{bail, ensure, Context, Result};
 use rand::Rng;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokenizers::Tokenizer;
 
 #[derive(Debug, Clone)]
@@ -32,7 +34,7 @@ impl Default for EngineOptions {
 }
 
 pub struct InferenceEngine {
-    pub model: LlamaModel,
+    pub model: Box<dyn CausalModel>,
     pub tokenizer: Tokenizer,
     pub kv_cache: KVCache,
     pub buffers: InferenceBuffers,
@@ -55,18 +57,18 @@ impl InferenceEngine {
     pub fn from_path(path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
         validate_sampling(&options)?;
         let path = path.as_ref();
-        let model = ModelLoader::load(path, &options.load)?;
+        let model = ModelLoader::load_dynamic(path, &options.load)?;
         let tokenizer_path = tokenizer_path(path);
         let tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", tokenizer_path.display()))?;
         let context_length = options
             .context_length
-            .min(model.config.max_position_embeddings);
+            .min(model.config().max_position_embeddings);
         ensure!(context_length > 0, "context length must be positive");
-        let kv_cache = KVCache::new(&model.config, context_length)?;
-        let buffers = InferenceBuffers::new(&model.config, context_length);
+        let kv_cache = KVCache::new(model.config(), context_length)?;
+        let buffers = InferenceBuffers::new(model.config(), context_length);
         let eos_token_ids = find_eos_tokens(path, &tokenizer)?;
-        let vocab_size = model.config.vocab_size;
+        let vocab_size = model.config().vocab_size;
 
         Ok(Self {
             model,
@@ -92,16 +94,29 @@ impl InferenceEngine {
 
     /// Runs the model on one token at the specified position, then samples its successor.
     pub fn forward_step(&mut self, token_id: u32, pos: usize) -> Result<u32> {
-        self.model
-            .forward(token_id, pos, &mut self.kv_cache, &mut self.buffers)?;
+        self.model.forward_token(
+            token_id,
+            pos,
+            &mut self.kv_cache,
+            &mut self.buffers,
+            LogitsMode::Compute,
+        )?;
         let next = self.sample_current_logits();
         self.remember(next);
         Ok(next)
     }
 
-    /// Prefills every prompt token (rather than only its final token), then performs cached decode.
+    /// Prefills every prompt token, then performs cached decode.
     /// The returned string contains only newly generated tokens.
     pub fn generate(&mut self, prompt: &str, max_new_tokens: usize) -> Result<String> {
+        Ok(self.generate_with_metrics(prompt, max_new_tokens)?.text)
+    }
+
+    pub fn generate_with_metrics(
+        &mut self,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<GenerationOutput> {
         let encoding = self
             .tokenizer
             .encode(prompt, false)
@@ -127,14 +142,16 @@ impl InferenceEngine {
         {
             self.remember(token);
         }
-        for (pos, &token) in prompt_tokens.iter().enumerate() {
-            self.model
-                .forward(token, pos, &mut self.kv_cache, &mut self.buffers)?;
-        }
+
+        let prefill_started = Instant::now();
+        self.model
+            .prefill(prompt_tokens, 0, &mut self.kv_cache, &mut self.buffers)?;
+        let prefill = prefill_started.elapsed();
 
         let available = self.kv_cache.max_seq_len - prompt_tokens.len();
         let count = max_new_tokens.min(available);
         let mut generated = Vec::with_capacity(count);
+        let decode_started = Instant::now();
         for _ in 0..count {
             let token = self.sample_current_logits();
             generated.push(token);
@@ -142,15 +159,85 @@ impl InferenceEngine {
             if self.eos_token_ids.contains(&token) {
                 break;
             }
-            // Position of this newly sampled token in the complete sequence.
             let pos = prompt_tokens.len() + generated.len() - 1;
-            self.model
-                .forward(token, pos, &mut self.kv_cache, &mut self.buffers)?;
+            self.model.forward_token(
+                token,
+                pos,
+                &mut self.kv_cache,
+                &mut self.buffers,
+                LogitsMode::Compute,
+            )?;
         }
-
-        self.tokenizer
+        let decode = decode_started.elapsed();
+        let text = self
+            .tokenizer
             .decode(&generated, true)
-            .map_err(|e| anyhow::anyhow!("tokenizer decode error: {e}"))
+            .map_err(|e| anyhow::anyhow!("tokenizer decode error: {e}"))?;
+        Ok(GenerationOutput {
+            text,
+            metrics: InferenceMetrics {
+                prompt_tokens: prompt_tokens.len(),
+                generated_tokens: generated.len(),
+                prefill,
+                decode,
+            },
+            token_ids: generated,
+        })
+    }
+
+    /// Low-level benchmark API. It avoids tokenization and sampling overhead.
+    pub fn benchmark_tokens(
+        &mut self,
+        prompt_tokens: &[u32],
+        decode_tokens: usize,
+    ) -> Result<InferenceMetrics> {
+        ensure!(!prompt_tokens.is_empty(), "benchmark prompt is empty");
+        ensure!(
+            prompt_tokens.len() + decode_tokens <= self.kv_cache.max_seq_len,
+            "benchmark token counts exceed context"
+        );
+        self.reset();
+        let started = Instant::now();
+        self.model
+            .prefill(prompt_tokens, 0, &mut self.kv_cache, &mut self.buffers)?;
+        let prefill = started.elapsed();
+
+        let started = Instant::now();
+        for step in 0..decode_tokens {
+            let token = self.argmax_current_logits();
+            self.model.forward_token(
+                token,
+                prompt_tokens.len() + step,
+                &mut self.kv_cache,
+                &mut self.buffers,
+                LogitsMode::Compute,
+            )?;
+        }
+        let decode = started.elapsed();
+        Ok(InferenceMetrics {
+            prompt_tokens: prompt_tokens.len(),
+            generated_tokens: decode_tokens,
+            prefill,
+            decode,
+        })
+    }
+
+    pub fn backend_summary(&self) -> String {
+        format!(
+            "{} / {} threads",
+            self.model.backend().name(),
+            self.model.backend().threads()
+        )
+    }
+
+    fn argmax_current_logits(&self) -> u32 {
+        self.buffers
+            .logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index as u32)
+            .unwrap_or(0)
     }
 
     fn remember(&mut self, token: u32) {

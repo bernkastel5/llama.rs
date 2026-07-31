@@ -1,7 +1,10 @@
+use crate::architecture::{ArchitectureKind, CausalModel, LogitsMode};
+use crate::backend::KernelBackend;
 use crate::cache::{InferenceBuffers, KVCache};
 use crate::config::LlamaConfig;
 use crate::quant::QuantTensor;
 use anyhow::{ensure, Result};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct LinearLayer {
@@ -27,8 +30,13 @@ impl LinearLayer {
         })
     }
 
-    pub fn forward(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
-        self.weight.matvec(input, output)?;
+    pub fn forward(
+        &self,
+        backend: &dyn KernelBackend,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.weight.matvec_with(backend, input, output)?;
         if let Some(bias) = &self.bias {
             for (value, bias) in output.iter_mut().zip(bias) {
                 *value += *bias;
@@ -65,17 +73,24 @@ impl RMSNorm {
     }
 }
 
+fn prepare_rope(pos: usize, head_dim: usize, rope_theta: f32, cos: &mut [f32], sin: &mut [f32]) {
+    for i in 0..head_dim / 2 {
+        let inv_freq = 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32);
+        let angle = pos as f32 * inv_freq;
+        let (s, c) = angle.sin_cos();
+        cos[i] = c;
+        sin[i] = s;
+    }
+}
+
 /// Qwen2 uses the non-interleaved (split-half) RoPE convention.
-pub fn apply_rope_inplace(x: &mut [f32], pos: usize, rope_theta: f32) {
+fn apply_rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
     let half = x.len() / 2;
     for i in 0..half {
-        let inv_freq = 1.0 / rope_theta.powf(2.0 * i as f32 / x.len() as f32);
-        let angle = pos as f32 * inv_freq;
-        let (sin, cos) = angle.sin_cos();
         let real = x[i];
         let imag = x[i + half];
-        x[i] = real * cos - imag * sin;
-        x[i + half] = real * sin + imag * cos;
+        x[i] = real * cos[i] - imag * sin[i];
+        x[i + half] = real * sin[i] + imag * cos[i];
     }
 }
 
@@ -93,16 +108,20 @@ pub struct TransformerBlock {
 }
 
 #[derive(Debug, Clone)]
-pub struct LlamaModel {
+pub struct Qwen2Model {
     pub embed_tokens: QuantTensor,
     pub layers: Vec<TransformerBlock>,
     pub norm: RMSNorm,
     pub lm_head: LinearLayer,
     pub config: LlamaConfig,
+    pub backend: Arc<dyn KernelBackend>,
 }
 
-impl LlamaModel {
-    /// Decodes one token and writes vocabulary logits to `buffers.logits`.
+/// Backward-compatible name retained for the original public API.
+pub type LlamaModel = Qwen2Model;
+
+impl Qwen2Model {
+    /// Compatibility wrapper that computes vocabulary logits.
     pub fn forward(
         &self,
         token_id: u32,
@@ -110,7 +129,19 @@ impl LlamaModel {
         kv_cache: &mut KVCache,
         buffers: &mut InferenceBuffers,
     ) -> Result<()> {
+        self.forward_impl(token_id, pos, kv_cache, buffers, LogitsMode::Compute)
+    }
+
+    fn forward_impl(
+        &self,
+        token_id: u32,
+        pos: usize,
+        kv_cache: &mut KVCache,
+        buffers: &mut InferenceBuffers,
+        logits: LogitsMode,
+    ) -> Result<()> {
         let cfg = &self.config;
+        let backend = self.backend.as_ref();
         ensure!(
             (token_id as usize) < cfg.vocab_size,
             "token id {token_id} is outside vocabulary"
@@ -128,6 +159,13 @@ impl LlamaModel {
         let kv_width = cfg.kv_width();
         let groups = num_heads / num_kv_heads;
         let attention_scale = 1.0 / (head_dim as f32).sqrt();
+        prepare_rope(
+            pos,
+            head_dim,
+            cfg.rope_theta,
+            &mut buffers.rope_cos,
+            &mut buffers.rope_sin,
+        );
 
         self.embed_tokens
             .row_into(token_id as usize, &mut buffers.residual)?;
@@ -139,21 +177,29 @@ impl LlamaModel {
 
             block
                 .self_attn_q
-                .forward(&buffers.hidden_states, &mut buffers.q)?;
+                .forward(backend, &buffers.hidden_states, &mut buffers.q)?;
             block
                 .self_attn_k
-                .forward(&buffers.hidden_states, &mut buffers.k)?;
+                .forward(backend, &buffers.hidden_states, &mut buffers.k)?;
             block
                 .self_attn_v
-                .forward(&buffers.hidden_states, &mut buffers.v)?;
+                .forward(backend, &buffers.hidden_states, &mut buffers.v)?;
 
             for head in 0..num_heads {
                 let start = head * head_dim;
-                apply_rope_inplace(&mut buffers.q[start..start + head_dim], pos, cfg.rope_theta);
+                apply_rope_inplace(
+                    &mut buffers.q[start..start + head_dim],
+                    &buffers.rope_cos,
+                    &buffers.rope_sin,
+                );
             }
             for head in 0..num_kv_heads {
                 let start = head * head_dim;
-                apply_rope_inplace(&mut buffers.k[start..start + head_dim], pos, cfg.rope_theta);
+                apply_rope_inplace(
+                    &mut buffers.k[start..start + head_dim],
+                    &buffers.rope_cos,
+                    &buffers.rope_sin,
+                );
             }
 
             kv_cache.update(layer_idx, pos, &buffers.k, &buffers.v)?;
@@ -186,7 +232,7 @@ impl LlamaModel {
 
             block
                 .self_attn_o
-                .forward(&buffers.attention, &mut buffers.projection)?;
+                .forward(backend, &buffers.attention, &mut buffers.projection)?;
             for i in 0..hidden {
                 buffers.residual[i] += buffers.projection[i];
             }
@@ -198,25 +244,54 @@ impl LlamaModel {
                 .forward(&mut buffers.hidden_states)?;
             block
                 .mlp_gate
-                .forward(&buffers.hidden_states, &mut buffers.gate)?;
+                .forward(backend, &buffers.hidden_states, &mut buffers.gate)?;
             block
                 .mlp_up
-                .forward(&buffers.hidden_states, &mut buffers.up)?;
+                .forward(backend, &buffers.hidden_states, &mut buffers.up)?;
             for i in 0..cfg.intermediate_size {
                 let gate = buffers.gate[i];
                 buffers.gate[i] = (gate / (1.0 + (-gate).exp())) * buffers.up[i];
             }
-            block.mlp_down.forward(&buffers.gate, &mut buffers.down)?;
+            block
+                .mlp_down
+                .forward(backend, &buffers.gate, &mut buffers.down)?;
             for i in 0..hidden {
                 buffers.residual[i] += buffers.down[i];
             }
         }
 
-        buffers.hidden_states.copy_from_slice(&buffers.residual);
-        self.norm.forward(&mut buffers.hidden_states)?;
-        self.lm_head
-            .forward(&buffers.hidden_states, &mut buffers.logits)?;
+        if logits == LogitsMode::Compute {
+            buffers.hidden_states.copy_from_slice(&buffers.residual);
+            self.norm.forward(&mut buffers.hidden_states)?;
+            self.lm_head
+                .forward(backend, &buffers.hidden_states, &mut buffers.logits)?;
+        }
         Ok(())
+    }
+}
+
+impl CausalModel for Qwen2Model {
+    fn architecture(&self) -> ArchitectureKind {
+        ArchitectureKind::Qwen2
+    }
+
+    fn config(&self) -> &LlamaConfig {
+        &self.config
+    }
+
+    fn backend(&self) -> &dyn KernelBackend {
+        self.backend.as_ref()
+    }
+
+    fn forward_token(
+        &self,
+        token_id: u32,
+        pos: usize,
+        kv_cache: &mut KVCache,
+        buffers: &mut InferenceBuffers,
+        logits: LogitsMode,
+    ) -> Result<()> {
+        self.forward_impl(token_id, pos, kv_cache, buffers, logits)
     }
 }
 

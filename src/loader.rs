@@ -1,3 +1,5 @@
+use crate::architecture::{ArchitectureKind, CausalModel};
+use crate::backend::{BackendConfig, CpuBackend, KernelBackend};
 use crate::config::LlamaConfig;
 use crate::gguf::GgufFile;
 use crate::model::{LinearLayer, LlamaModel, RMSNorm, TransformerBlock};
@@ -25,13 +27,22 @@ pub enum LoadQuantization {
 #[derive(Debug, Clone, Default)]
 pub struct LoadOptions {
     pub quantization: LoadQuantization,
+    pub backend: BackendConfig,
 }
 
 pub struct ModelLoader;
 
 impl ModelLoader {
-    /// `path` can be a Hugging Face model directory, a `.safetensors` file,
-    /// or a single `.gguf` file.
+    /// Architecture-neutral loader used by the inference engine.
+    pub fn load_dynamic(
+        path: impl AsRef<Path>,
+        options: &LoadOptions,
+    ) -> Result<Box<dyn CausalModel>> {
+        Ok(Box::new(Self::load(path, options)?))
+    }
+
+    /// Qwen2 compatibility entry point. `path` can be a Hugging Face model
+    /// directory, a `.safetensors` file, or a single `.gguf` file.
     pub fn load(path: impl AsRef<Path>, options: &LoadOptions) -> Result<LlamaModel> {
         let path = path.as_ref();
         if path.is_file() && path.extension().and_then(|v| v.to_str()) == Some("gguf") {
@@ -74,7 +85,18 @@ impl SafetensorsLoader {
         let config_path = model_dir.join("config.json");
         let config_json = std::fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config_value: serde_json::Value = serde_json::from_str(&config_json)?;
+        let model_type = config_value
+            .get("model_type")
+            .and_then(|value| value.as_str())
+            .context("config.json is missing model_type")?;
+        let architecture = ArchitectureKind::from_hf_model_type(model_type)?;
+        ensure!(
+            architecture == ArchitectureKind::Qwen2,
+            "internal architecture registry mismatch"
+        );
         let config = LlamaConfig::from_json(&config_json)?;
+        let backend: Arc<dyn KernelBackend> = Arc::new(CpuBackend::new(&options.backend)?);
         let store = SafetensorStore::open(model_dir)?;
 
         let embed_tokens = load_st_matrix(
@@ -200,6 +222,7 @@ impl SafetensorsLoader {
             norm,
             lm_head,
             config,
+            backend,
         })
     }
 }
@@ -210,11 +233,13 @@ impl GgufLoader {
     pub fn load(path: impl AsRef<Path>, options: &LoadOptions) -> Result<LlamaModel> {
         let path = path.as_ref();
         let gguf = GgufFile::open(path)?;
-        let architecture = gguf.metadata_str("general.architecture")?;
+        let architecture =
+            ArchitectureKind::from_gguf_architecture(gguf.metadata_str("general.architecture")?)?;
         ensure!(
-            architecture == "qwen2",
-            "GGUF architecture {architecture:?} is unsupported; this MVP supports qwen2/Qwen2.5"
+            architecture == ArchitectureKind::Qwen2,
+            "internal architecture registry mismatch"
         );
+        let backend: Arc<dyn KernelBackend> = Arc::new(CpuBackend::new(&options.backend)?);
 
         let token_info = gguf.tensor_info("token_embd.weight")?;
         ensure!(
@@ -369,6 +394,7 @@ impl GgufLoader {
             norm,
             lm_head,
             config,
+            backend,
         })
     }
 }

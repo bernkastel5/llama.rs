@@ -1,5 +1,6 @@
 use anyhow::{bail, Context, Result};
-use llama_rs::{EngineOptions, InferenceEngine, LoadQuantization};
+use llama_rs::backend::{BackendConfig, KernelPreference};
+use llama_rs::{EngineOptions, InferenceEngine, LoadOptions, LoadQuantization};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -9,6 +10,8 @@ struct Args {
     quantization: LoadQuantization,
     context: usize,
     max_tokens: usize,
+    threads: usize,
+    kernel: KernelPreference,
 }
 
 fn parse_args() -> Result<Args> {
@@ -18,6 +21,8 @@ fn parse_args() -> Result<Args> {
         quantization: LoadQuantization::None,
         context: 4096,
         max_tokens: 512,
+        threads: 0,
+        kernel: KernelPreference::Auto,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -49,9 +54,19 @@ fn parse_args() -> Result<Args> {
                     .context("--max-tokens requires a number")?
                     .parse()?
             }
+            "--threads" | "-t" => {
+                result.threads = args
+                    .next()
+                    .context("--threads requires a number")?
+                    .parse()?
+            }
+            "--backend" => {
+                result.kernel =
+                    KernelPreference::parse(&args.next().context("--backend requires a name")?)?
+            }
             "--help" | "-h" => {
                 println!(
-                    "llama-rs --model PATH [--quantize none|q4k|q4km] [--context N] [--max-tokens N]"
+                    "llama-rs --model PATH [--quantize none|q4k|q4km] [--context N] [--max-tokens N] [--threads N] [--backend auto|scalar|avx2|neon]"
                 );
                 println!(
                     "PATH is a Hugging Face model directory, .safetensors file, or .gguf file."
@@ -66,9 +81,18 @@ fn parse_args() -> Result<Args> {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    let mut options = EngineOptions::default();
-    options.load.quantization = args.quantization;
-    options.context_length = args.context;
+    let options = EngineOptions {
+        load: LoadOptions {
+            quantization: args.quantization,
+            backend: BackendConfig {
+                threads: args.threads,
+                kernel: args.kernel,
+                ..BackendConfig::default()
+            },
+        },
+        context_length: args.context,
+        ..EngineOptions::default()
+    };
 
     println!("=== llama.rs — CPU-only Qwen2 ===");
     println!(
@@ -79,10 +103,11 @@ fn main() -> Result<()> {
     let started = Instant::now();
     let mut engine = InferenceEngine::from_path(&args.model, options)?;
     println!(
-        "Loaded {} layers, hidden {}, context {} in {:.2?}\n",
-        engine.model.config.num_hidden_layers,
-        engine.model.config.hidden_size,
+        "Loaded {} layers, hidden {}, context {}, backend {} in {:.2?}\n",
+        engine.model.config().num_hidden_layers,
+        engine.model.config().hidden_size,
         engine.kv_cache.max_seq_len,
+        engine.backend_summary(),
         started.elapsed()
     );
 
@@ -105,10 +130,15 @@ fn main() -> Result<()> {
         let prompt = format!(
             "<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n"
         );
-        let started = Instant::now();
-        let response = engine.generate(&prompt, args.max_tokens)?;
-        println!("\nAssistant: {}", response.trim());
-        println!("[{:.2?}]\n", started.elapsed());
+        let response = engine.generate_with_metrics(&prompt, args.max_tokens)?;
+        println!("\nAssistant: {}", response.text.trim());
+        println!(
+            "[prefill: {:.2} tok/s ({} tokens), decode: {:.2} tok/s ({} tokens)]\n",
+            response.metrics.prefill_tokens_per_second(),
+            response.metrics.prompt_tokens,
+            response.metrics.decode_tokens_per_second(),
+            response.metrics.generated_tokens,
+        );
     }
     Ok(())
 }

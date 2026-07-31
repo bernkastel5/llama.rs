@@ -1,82 +1,114 @@
-use anyhow::Result;
-use candle_core::{Device, DType, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::qwen2::{Config, Model as Qwen2Model};
-use tokenizers::Tokenizer;
+use anyhow::{bail, Context, Result};
+use llama_rs::{EngineOptions, InferenceEngine, LoadQuantization};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::time::Instant;
 
-fn main() -> Result<()> {
-    println!("=== llama.rs (Candle + Qwen2) ===");
+struct Args {
+    model: PathBuf,
+    quantization: LoadQuantization,
+    context: usize,
+    max_tokens: usize,
+}
 
-    let model_dir = "model/qwen-0.5b";
-    let device = Device::Cpu;
-    let max_new_tokens = 60;
-
-    let config: Config = serde_json::from_str(
-        &std::fs::read_to_string(format!("{}/config.json", model_dir))?
-    )?;
-
-    let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_dir))
-        .map_err(|e| anyhow::anyhow!("Tokenizer error: {}", e))?;
-
-    let safetensors_path = format!("{}/model.safetensors", model_dir);
-    let vb = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[safetensors_path.clone()], DType::F32, &device)?
+fn parse_args() -> Result<Args> {
+    let mut args = std::env::args().skip(1);
+    let mut result = Args {
+        model: PathBuf::from("model/qwen-0.5b"),
+        quantization: LoadQuantization::None,
+        context: 4096,
+        max_tokens: 512,
     };
-
-    let mut model = Qwen2Model::new(&config, vb)?;
-
-    let vb_embed = unsafe {
-        VarBuilder::from_mmaped_safetensors(&[safetensors_path], DType::F32, &device)?
-    };
-
-    // Явно указываем форму [vocab_size, hidden_size]
-    let embed_tokens = vb_embed.get((151936, 896), "model.embed_tokens.weight")?;
-
-    println!("Model loaded successfully!");
-
-    // ===================== ЧАТ-ШАБЛОН QWEN (вручную) =====================
-    let prompt = r#"<|im_start|>system
-You are a helpful assistant.<|im_end|>
-<|im_start|>user
-Hello, world!<|im_end|>
-<|im_start|>assistant
-"#;
-
-    println!("Formatted prompt:\n{}", prompt);
-
-    let encoding = tokenizer.encode(prompt, true)
-        .map_err(|e| anyhow::anyhow!("Encode error: {}", e))?;
-    let mut tokens: Vec<u32> = encoding.get_ids().to_vec();
-
-    println!("Generating...");
-
-    for step in 0..max_new_tokens {
-        let last_token = *tokens.last().unwrap();
-        let input = Tensor::new(&[last_token], &device)?.unsqueeze(0)?;
-        let position_ids = Tensor::new(&[tokens.len() as u32 - 1], &device)?.unsqueeze(0)?;
-
-        let hidden_states = model.forward(&input, step, Some(&position_ids))?;
-
-        let last_hidden = hidden_states.squeeze(0)?;
-        let last_token_hidden = last_hidden.get(0)?;
-
-        let logits = last_token_hidden
-            .unsqueeze(0)?
-            .matmul(&embed_tokens.t()?)?;
-        let logits = logits.squeeze(0)?;
-
-        let next_token = logits.argmax(0)?.to_scalar::<u32>()?;
-
-        tokens.push(next_token);
-
-        if next_token == 151645 {
-            break;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--model" | "-m" => {
+                result.model = PathBuf::from(args.next().context("--model requires a path")?)
+            }
+            "--quantize" | "-q" => {
+                result.quantization = match args
+                    .next()
+                    .context("--quantize requires none, q4k, or q4km")?
+                    .to_ascii_lowercase()
+                    .as_str()
+                {
+                    "none" => LoadQuantization::None,
+                    "q4k" | "q4_k" => LoadQuantization::Q4K,
+                    "q4km" | "q4_k_m" => LoadQuantization::Q4KM,
+                    value => bail!("unknown quantization {value:?}; use none, q4k, or q4km"),
+                }
+            }
+            "--context" | "-c" => {
+                result.context = args
+                    .next()
+                    .context("--context requires a number")?
+                    .parse()?
+            }
+            "--max-tokens" | "-n" => {
+                result.max_tokens = args
+                    .next()
+                    .context("--max-tokens requires a number")?
+                    .parse()?
+            }
+            "--help" | "-h" => {
+                println!(
+                    "llama-rs --model PATH [--quantize none|q4k|q4km] [--context N] [--max-tokens N]"
+                );
+                println!(
+                    "PATH is a Hugging Face model directory, .safetensors file, or .gguf file."
+                );
+                std::process::exit(0);
+            }
+            value => bail!("unknown argument {value:?}; try --help"),
         }
     }
+    Ok(result)
+}
 
-    let generated_text = tokenizer.decode(&tokens, true)
-        .map_err(|e| anyhow::anyhow!("Decode error: {}", e))?;
+fn main() -> Result<()> {
+    let args = parse_args()?;
+    let mut options = EngineOptions::default();
+    options.load.quantization = args.quantization;
+    options.context_length = args.context;
 
-    println!("\nGenerated:\n{}", generated_text);
+    println!("=== llama.rs — CPU-only Qwen2 ===");
+    println!(
+        "Loading {} ({:?})...",
+        args.model.display(),
+        args.quantization
+    );
+    let started = Instant::now();
+    let mut engine = InferenceEngine::from_path(&args.model, options)?;
+    println!(
+        "Loaded {} layers, hidden {}, context {} in {:.2?}\n",
+        engine.model.config.num_hidden_layers,
+        engine.model.config.hidden_size,
+        engine.kv_cache.max_seq_len,
+        started.elapsed()
+    );
+
+    let system_prompt = "You are a helpful, concise, and direct AI assistant.";
+    loop {
+        print!("User: ");
+        io::stdout().flush()?;
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input)? == 0 {
+            break;
+        }
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if input.eq_ignore_ascii_case("exit") || input.eq_ignore_ascii_case("quit") {
+            break;
+        }
+
+        let prompt = format!(
+            "<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let started = Instant::now();
+        let response = engine.generate(&prompt, args.max_tokens)?;
+        println!("\nAssistant: {}", response.trim());
+        println!("[{:.2?}]\n", started.elapsed());
+    }
     Ok(())
 }

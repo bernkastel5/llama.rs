@@ -1,7 +1,13 @@
+use crate::activation::{
+    activation_layout, quantize_activation_q8_32, quantize_activation_q8k, ActivationLayout,
+    BlockQ8K, BlockQ8_32, QK_K,
+};
 use crate::quant::{dot_row_for_kernel, QuantTensor};
+use crate::simd::{dot_row_avx2_q8_32, dot_row_avx2_q8k};
 use anyhow::{bail, ensure, Result};
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use std::cell::RefCell;
 use std::fmt;
 use std::sync::Arc;
 
@@ -123,6 +129,41 @@ impl CpuBackend {
     pub fn kernel_kind(&self) -> KernelKind {
         self.inner.kind
     }
+
+    /// Which integer activation layout applies, if any.
+    ///
+    /// Requires the AVX2 kernel set and a column count that divides evenly into
+    /// the layout's block size, so no partial block is ever left unscaled.
+    fn integer_layout(&self, kind: KernelKind, weight: &QuantTensor) -> ActivationLayout {
+        if kind != KernelKind::Avx2 {
+            return ActivationLayout::None;
+        }
+        match activation_layout(weight.quant_type) {
+            ActivationLayout::Q8K if weight.cols() % QK_K == 0 => ActivationLayout::Q8K,
+            ActivationLayout::Q8_32 if weight.cols() % 32 == 0 => ActivationLayout::Q8_32,
+            _ => ActivationLayout::None,
+        }
+    }
+
+    /// Shared row loop, so the serial and parallel policies live in one place
+    /// instead of being duplicated per kernel.
+    fn run_rows<F>(&self, parallel: bool, output: &mut [f32], compute: F)
+    where
+        F: Fn(usize) -> f32 + Sync + Send,
+    {
+        if parallel {
+            self.inner.pool.install(|| {
+                output
+                    .par_iter_mut()
+                    .enumerate()
+                    .for_each(|(row, out)| *out = compute(row));
+            });
+        } else {
+            for (row, out) in output.iter_mut().enumerate() {
+                *out = compute(row);
+            }
+        }
+    }
 }
 
 impl Default for CpuBackend {
@@ -144,10 +185,43 @@ impl KernelBackend for CpuBackend {
         weight.validate_matvec(input, output)?;
         let work = weight.rows().saturating_mul(weight.cols());
         let kind = self.inner.kind;
-        if self.inner.threads > 1
+        let parallel = self.inner.threads > 1
             && weight.rows() >= self.inner.threads * 2
-            && work >= self.inner.parallel_threshold
-        {
+            && work >= self.inner.parallel_threshold;
+
+        // Quantizing the activation is worth it only when it is amortized over
+        // many rows, so it happens once per matrix here rather than per row.
+        match self.integer_layout(kind, weight) {
+            ActivationLayout::Q8K => {
+                let ty = weight.quant_type;
+                let mut scratch = take_q8k_scratch();
+                quantize_activation_q8k(input, &mut scratch);
+                let activation: &[BlockQ8K] = &scratch;
+                self.run_rows(parallel, output, |row| {
+                    let data = weight.row_data(row);
+                    dot_row_avx2_q8k(data, ty, activation)
+                        .unwrap_or_else(|| dot_row_for_kernel(kind, data, ty, input))
+                });
+                restore_q8k_scratch(scratch);
+                return Ok(());
+            }
+            ActivationLayout::Q8_32 => {
+                let ty = weight.quant_type;
+                let mut scratch = take_q8_32_scratch();
+                quantize_activation_q8_32(input, &mut scratch);
+                let activation: &[BlockQ8_32] = &scratch;
+                self.run_rows(parallel, output, |row| {
+                    let data = weight.row_data(row);
+                    dot_row_avx2_q8_32(data, ty, activation)
+                        .unwrap_or_else(|| dot_row_for_kernel(kind, data, ty, input))
+                });
+                restore_q8_32_scratch(scratch);
+                return Ok(());
+            }
+            ActivationLayout::None => {}
+        }
+
+        if parallel {
             self.inner.pool.install(|| {
                 output.par_iter_mut().enumerate().for_each(|(row, out)| {
                     *out = dot_row_for_kernel(kind, weight.row_data(row), weight.quant_type, input)
@@ -160,6 +234,53 @@ impl KernelBackend for CpuBackend {
         }
         Ok(())
     }
+}
+
+thread_local! {
+    /// Reused across matvec calls so the hot path performs no allocation.
+    static Q8K_SCRATCH: RefCell<Vec<BlockQ8K>> = const { RefCell::new(Vec::new()) };
+    static Q8_32_SCRATCH: RefCell<Vec<BlockQ8_32>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Moving the buffer out and back keeps the borrow short and makes reentrant
+/// calls allocate rather than panic. `mem::take` hands over the existing
+/// allocation; `split_off(0)` would have allocated on every call.
+fn take_q8k_scratch() -> Vec<BlockQ8K> {
+    Q8K_SCRATCH.with(|cell| {
+        cell.try_borrow_mut()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default()
+    })
+}
+
+fn take_q8_32_scratch() -> Vec<BlockQ8_32> {
+    Q8_32_SCRATCH.with(|cell| {
+        cell.try_borrow_mut()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default()
+    })
+}
+
+fn restore_q8k_scratch(buffer: Vec<BlockQ8K>) {
+    Q8K_SCRATCH.with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut() {
+            // Keep whichever allocation is larger so the steady state stops
+            // growing after the widest matrix has been seen once.
+            if buffer.capacity() >= slot.capacity() {
+                *slot = buffer;
+            }
+        }
+    });
+}
+
+fn restore_q8_32_scratch(buffer: Vec<BlockQ8_32>) {
+    Q8_32_SCRATCH.with(|cell| {
+        if let Ok(mut slot) = cell.try_borrow_mut() {
+            if buffer.capacity() >= slot.capacity() {
+                *slot = buffer;
+            }
+        }
+    });
 }
 
 fn select_kernel(preference: KernelPreference) -> Result<KernelKind> {

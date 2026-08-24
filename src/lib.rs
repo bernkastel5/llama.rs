@@ -8,6 +8,7 @@
 //! - separate architecture/backend traits and measured prefill/decode
 //! - GQA, split-half RoPE, RMSNorm, SwiGLU and a preallocated KV cache
 
+pub mod activation;
 pub mod architecture;
 pub mod backend;
 pub mod benchmark;
@@ -18,7 +19,8 @@ pub mod gguf;
 pub mod loader;
 pub mod model;
 pub mod quant;
-mod simd;
+pub mod track;
+pub(crate) mod simd;
 
 pub use architecture::{ArchitectureKind, CausalModel, LogitsMode};
 pub use benchmark::{GenerationOutput, InferenceMetrics};

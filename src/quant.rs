@@ -1037,6 +1037,123 @@ mod tests {
     }
 
     #[test]
+    fn q8k_activation_kernel_matches_scalar() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            use crate::activation::quantize_activation_q8k;
+            use crate::simd::dot_row_avx2_q8k;
+
+            // 512 columns exercises the multi-super-block path.
+            let values: Vec<f32> = (0..512)
+                .map(|i| ((i as f32 * 0.041).sin() + (i as f32 * 0.011).cos()) * 0.35)
+                .collect();
+            let tensor = QuantTensor::quantize_q4k(&values, 1, 512).unwrap();
+            assert_eq!(tensor.quant_type, QuantType::Q4K);
+
+            for scale in [1.0f32, 0.001, 40.0] {
+                let input: Vec<f32> = (0..512)
+                    .map(|i| (i as f32 * 0.023).cos() * scale)
+                    .collect();
+                let mut blocks = Vec::new();
+                quantize_activation_q8k(&input, &mut blocks);
+
+                let row = tensor.row_data(0);
+                let reference = dot_row_scalar(row, QuantType::Q4K, &input);
+                let integer = dot_row_avx2_q8k(row, QuantType::Q4K, &blocks)
+                    .expect("Q4_K integer kernel must exist on AVX2");
+
+                // Q8_K activations carry ~7 bits of mantissa, so this compares
+                // against the f32 reference with a quantization-sized budget
+                // rather than a floating-point epsilon.
+                let magnitude: f32 = input.iter().map(|v| v.abs()).sum::<f32>() * 0.02;
+                let tolerance = magnitude.max(2e-3 * reference.abs().max(1.0));
+                assert!(
+                    (reference - integer).abs() <= tolerance,
+                    "scale={scale}: scalar={reference}, int8={integer}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8_32_kernels_match_scalar() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            use crate::activation::quantize_activation_q8_32;
+            use crate::simd::dot_row_avx2_q8_32;
+
+            // 896 columns is the real Qwen2.5-0.5B projection width, and it is
+            // deliberately not a multiple of QK_K.
+            let cols = 896;
+            let values: Vec<f32> = (0..cols)
+                .map(|i| ((i as f32 * 0.053).sin() + (i as f32 * 0.017).cos()) * 0.4)
+                .collect();
+
+            let tensors = [
+                QuantTensor::quantize_q8_0(&values, 1, cols).unwrap(),
+                QuantTensor::quantize_q5_0(&values, 1, cols).unwrap(),
+            ];
+
+            for tensor in &tensors {
+                for scale in [1.0f32, 0.002, 25.0] {
+                    let input: Vec<f32> = (0..cols)
+                        .map(|i| (i as f32 * 0.031).sin() * scale)
+                        .collect();
+                    let mut blocks = Vec::new();
+                    quantize_activation_q8_32(&input, &mut blocks);
+
+                    let row = tensor.row_data(0);
+                    let reference = dot_row_scalar(row, tensor.quant_type, &input);
+                    let integer = dot_row_avx2_q8_32(row, tensor.quant_type, &blocks)
+                        .expect("integer kernel must exist for this type");
+
+                    let budget: f32 = input.iter().map(|v| v.abs()).sum::<f32>() * 0.02;
+                    let tolerance = budget.max(2e-3 * reference.abs().max(1.0));
+                    assert!(
+                        (reference - integer).abs() <= tolerance,
+                        "{} scale={scale}: scalar={reference}, int8={integer}",
+                        tensor.quant_type.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn integer_kernels_are_absent_for_unsupported_types() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            use crate::activation::quantize_activation_q8_32;
+            use crate::simd::dot_row_avx2_q8_32;
+
+            // Q6_K has no integer kernel yet; it must report absence so the
+            // caller falls back rather than producing a wrong number.
+            let values: Vec<f32> = (0..256).map(|i| (i as f32 * 0.03).sin()).collect();
+            let tensor = QuantTensor::quantize_q6k(&values, 1, 256).unwrap();
+            let mut blocks = Vec::new();
+            quantize_activation_q8_32(&values, &mut blocks);
+            assert!(dot_row_avx2_q8_32(tensor.row_data(0), tensor.quant_type, &blocks).is_none());
+        }
+    }
+
+    #[test]
+    fn q8k_zero_activation_is_zero() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            use crate::activation::quantize_activation_q8k;
+            use crate::simd::dot_row_avx2_q8k;
+
+            let values: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin()).collect();
+            let tensor = QuantTensor::quantize_q4k(&values, 1, 256).unwrap();
+            let mut blocks = Vec::new();
+            quantize_activation_q8k(&vec![0.0; 256], &mut blocks);
+            let result =
+                dot_row_avx2_q8k(tensor.row_data(0), QuantType::Q4K, &blocks).unwrap();
+            assert_eq!(result, 0.0);
+        }
+    }
+
+    #[test]
     fn q6k_and_q8_roundtrip() {
         let values: Vec<f32> = (0..512)
             .map(|i| ((i as f32 * 0.071).sin() - (i as f32 * 0.19).cos()) * 0.2)

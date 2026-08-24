@@ -58,6 +58,16 @@ pub struct BackendConfig {
     pub kernel: KernelPreference,
     /// Matrices with fewer multiply-adds run on the caller thread.
     pub parallel_threshold: usize,
+    /// Quantize activations to 8 bits so matvec can use integer kernels.
+    ///
+    /// This trades accuracy for speed: the integer kernels reproduce their
+    /// scalar reference to ~1e-7, but rounding the activation itself costs
+    /// roughly 1e-3 relative error. That is the same trade llama.cpp makes and
+    /// it is invisible in generated text, so inference enables it.
+    ///
+    /// Set to `false` for a reference-accuracy matvec (see
+    /// [`BackendConfig::reference`]).
+    pub integer_activations: bool,
 }
 
 impl Default for BackendConfig {
@@ -66,6 +76,20 @@ impl Default for BackendConfig {
             threads: 0,
             kernel: KernelPreference::Auto,
             parallel_threshold: 128 * 1024,
+            integer_activations: true,
+        }
+    }
+}
+
+impl BackendConfig {
+    /// Configuration that keeps every multiply in f32.
+    ///
+    /// Used where a matvec must match an exact dot product rather than merely
+    /// be close to one: numerical tests, tooling and accuracy comparisons.
+    pub fn reference() -> Self {
+        Self {
+            integer_activations: false,
+            ..Self::default()
         }
     }
 }
@@ -87,6 +111,7 @@ struct CpuBackendInner {
     kind: KernelKind,
     threads: usize,
     parallel_threshold: usize,
+    integer_activations: bool,
     pool: ThreadPool,
 }
 
@@ -96,6 +121,7 @@ impl fmt::Debug for CpuBackend {
             .field("kernel", &self.inner.kind.name())
             .field("threads", &self.inner.threads)
             .field("parallel_threshold", &self.inner.parallel_threshold)
+            .field("integer_activations", &self.inner.integer_activations)
             .finish()
     }
 }
@@ -121,6 +147,7 @@ impl CpuBackend {
                 kind,
                 threads,
                 parallel_threshold: config.parallel_threshold,
+                integer_activations: config.integer_activations,
                 pool,
             }),
         })
@@ -135,7 +162,7 @@ impl CpuBackend {
     /// Requires the AVX2 kernel set and a column count that divides evenly into
     /// the layout's block size, so no partial block is ever left unscaled.
     fn integer_layout(&self, kind: KernelKind, weight: &QuantTensor) -> ActivationLayout {
-        if kind != KernelKind::Avx2 {
+        if !self.inner.integer_activations || kind != KernelKind::Avx2 {
             return ActivationLayout::None;
         }
         match activation_layout(weight.quant_type) {

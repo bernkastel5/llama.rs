@@ -1,4 +1,4 @@
-use crate::backend::{CpuBackend, KernelBackend, KernelKind};
+use crate::backend::{BackendConfig, CpuBackend, KernelBackend, KernelKind};
 use crate::simd::{dot_row_avx2, dot_row_neon};
 use anyhow::{bail, ensure, Result};
 use half::{bf16, f16};
@@ -284,10 +284,19 @@ impl QuantTensor {
 
     /// Convenience entry point using an auto-detected CPU backend. Model inference
     /// keeps a persistent backend/thread-pool and calls `matvec_with` instead.
+    /// Reference matrix-vector product, computed entirely in f32.
+    ///
+    /// This is the accuracy baseline, so it deliberately does not quantize the
+    /// activation: callers use it to check other paths. Inference goes through
+    /// [`QuantTensor::matvec_with`] with the engine's backend, which may trade
+    /// ~1e-3 of relative error for a large speedup.
     pub fn matvec(&self, input: &[f32], output: &mut [f32]) -> Result<()> {
         static DEFAULT_BACKEND: OnceLock<CpuBackend> = OnceLock::new();
         DEFAULT_BACKEND
-            .get_or_init(CpuBackend::default)
+            .get_or_init(|| {
+                CpuBackend::new(&BackendConfig::reference())
+                    .expect("reference CPU backend must be constructible")
+            })
             .matvec(self, input, output)
     }
 
@@ -1073,6 +1082,94 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `QuantTensor::matvec` is the accuracy baseline and must stay exact.
+    ///
+    /// The integer path is a large speedup but costs ~1e-3 relative error, so
+    /// enabling it by default here would silently change the meaning of the
+    /// public API. This test is what catches that.
+    #[test]
+    fn reference_matvec_stays_exact_for_every_quant_type() {
+        let values: Vec<f32> = (0..512)
+            .map(|i| ((i as f32 * 0.17).sin() + (i as f32 * 0.03).cos()) * 0.3)
+            .collect();
+        let input: Vec<f32> = (0..256).map(|i| (i as f32 * 0.11).cos()).collect();
+
+        let tensors = [
+            QuantTensor::quantize_q4k(&values, 2, 256).unwrap(),
+            QuantTensor::quantize_q6k(&values, 2, 256).unwrap(),
+            QuantTensor::quantize_q8_0(&values, 2, 256).unwrap(),
+            QuantTensor::quantize_q5_0(&values, 2, 256).unwrap(),
+        ];
+
+        for tensor in &tensors {
+            let mut row = vec![0.0; 256];
+            tensor.row_into(1, &mut row).unwrap();
+            let expected: f32 = row.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+            let mut output = [0.0; 2];
+            tensor.matvec(&input, &mut output).unwrap();
+            assert!(
+                (output[1] - expected).abs() < 1e-4,
+                "{}: reference matvec drifted, got {} want {}",
+                tensor.quant_type.name(),
+                output[1],
+                expected
+            );
+        }
+    }
+
+    /// The integer path must be close to the reference, but is not expected to
+    /// be exact. This pins the size of the error so a real bug cannot hide
+    /// behind "8-bit is approximate".
+    #[test]
+    fn integer_activation_backend_tracks_the_reference() {
+        let values: Vec<f32> = (0..512)
+            .map(|i| ((i as f32 * 0.17).sin() + (i as f32 * 0.03).cos()) * 0.3)
+            .collect();
+        let input: Vec<f32> = (0..256).map(|i| (i as f32 * 0.11).cos()).collect();
+
+        let fast = CpuBackend::new(&BackendConfig::default()).unwrap();
+
+        for tensor in [
+            QuantTensor::quantize_q4k(&values, 2, 256).unwrap(),
+            QuantTensor::quantize_q8_0(&values, 2, 256).unwrap(),
+            QuantTensor::quantize_q5_0(&values, 2, 256).unwrap(),
+        ] {
+            let mut reference = [0.0; 2];
+            tensor.matvec(&input, &mut reference).unwrap();
+
+            let mut actual = [0.0; 2];
+            tensor.matvec_with(&fast, &input, &mut actual).unwrap();
+
+            for row in 0..2 {
+                let scale = reference[row].abs().max(1.0);
+                assert!(
+                    (actual[row] - reference[row]).abs() < 5e-2 * scale,
+                    "{} row {row}: integer={} reference={}",
+                    tensor.quant_type.name(),
+                    actual[row],
+                    reference[row]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reference_config_disables_the_integer_path() {
+        let backend = CpuBackend::new(&BackendConfig::reference()).unwrap();
+        let values: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin()).collect();
+        let input: Vec<f32> = (0..256).map(|i| (i as f32 * 0.09).cos()).collect();
+        let tensor = QuantTensor::quantize_q8_0(&values, 1, 256).unwrap();
+
+        let mut row = vec![0.0; 256];
+        tensor.row_into(0, &mut row).unwrap();
+        let expected: f32 = row.iter().zip(&input).map(|(a, b)| a * b).sum();
+
+        let mut output = [0.0; 1];
+        tensor.matvec_with(&backend, &input, &mut output).unwrap();
+        assert!((output[0] - expected).abs() < 1e-4);
     }
 
     #[test]

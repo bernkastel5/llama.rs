@@ -13,7 +13,10 @@
 use crate::quant::QuantType;
 
 /// Super-block length shared by the K-quants and by `BlockQ8K`.
-pub const QK_K: usize = 256;
+///
+/// Re-exported from `quant` so the block geometry has exactly one definition;
+/// a second `256` here could silently drift from the weight side.
+pub const QK_K: usize = crate::quant::QK_K;
 
 /// One super-block of activations quantized to 8 bits.
 ///
@@ -79,6 +82,7 @@ pub fn quantize_activation_q8k(input: &[f32], out: &mut Vec<BlockQ8K>) {
 /// code, and that constant factors out into a single multiply per block.
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
+#[allow(non_camel_case_types)] // matches the Q8_32 format name
 pub struct BlockQ8_32 {
     pub d: f32,
     pub qs: [i8; 32],

@@ -5,7 +5,7 @@ use half::{bf16, f16};
 use memmap2::Mmap;
 use std::sync::{Arc, OnceLock};
 
-const QK_K: usize = 256;
+pub(crate) const QK_K: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuantType {

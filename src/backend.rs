@@ -139,8 +139,8 @@ impl CpuBackend {
             return ActivationLayout::None;
         }
         match activation_layout(weight.quant_type) {
-            ActivationLayout::Q8K if weight.cols() % QK_K == 0 => ActivationLayout::Q8K,
-            ActivationLayout::Q8_32 if weight.cols() % 32 == 0 => ActivationLayout::Q8_32,
+            ActivationLayout::Q8K if weight.cols().is_multiple_of(QK_K) => ActivationLayout::Q8K,
+            ActivationLayout::Q8_32 if weight.cols().is_multiple_of(32) => ActivationLayout::Q8_32,
             _ => ActivationLayout::None,
         }
     }

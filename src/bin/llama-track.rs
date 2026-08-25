@@ -6,9 +6,9 @@
 //!               [--note "step 1"] [--history bench/history.csv]
 
 use anyhow::{bail, Context, Result};
-use llama_rs::backend::{BackendConfig, KernelBackend, KernelPreference};
+use llama_rs::backend::{BackendConfig, KernelPreference};
 use llama_rs::track::{append_record, format_trend, read_decode_history, TrackRecord};
-use llama_rs::{CausalModel, EngineOptions, InferenceEngine, LoadOptions, LoadQuantization};
+use llama_rs::{EngineOptions, InferenceEngine, LoadOptions, LoadQuantization};
 use std::path::PathBuf;
 use std::time::Instant;
 

@@ -1056,30 +1056,45 @@ mod tests {
             let values: Vec<f32> = (0..512)
                 .map(|i| ((i as f32 * 0.041).sin() + (i as f32 * 0.011).cos()) * 0.35)
                 .collect();
-            let tensor = QuantTensor::quantize_q4k(&values, 1, 512).unwrap();
-            assert_eq!(tensor.quant_type, QuantType::Q4K);
+            let q4 = QuantTensor::quantize_q4k(&values, 1, 512).unwrap();
+            let q6 = QuantTensor::quantize_q6k(&values, 1, 512).unwrap();
 
-            for scale in [1.0f32, 0.001, 40.0] {
-                let input: Vec<f32> = (0..512)
-                    .map(|i| (i as f32 * 0.023).cos() * scale)
-                    .collect();
-                let mut blocks = Vec::new();
-                quantize_activation_q8k(&input, &mut blocks);
+            // Deterministic, structurally valid Q5_K block (512 elements = 2 blocks = 352 bytes).
+            let mut q5k_data = vec![0u8; 352];
+            for block in 0..2 {
+                let off = block * 176;
+                q5k_data[off..off + 2].copy_from_slice(&f16::from_f32(0.003).to_bits().to_le_bytes());
+                q5k_data[off + 2..off + 4].copy_from_slice(&f16::from_f32(0.001).to_bits().to_le_bytes());
+                for (i, byte) in q5k_data[off + 4..off + 176].iter_mut().enumerate() {
+                    *byte = (i as u8).wrapping_mul(73).wrapping_add(19 + block as u8);
+                }
+            }
+            let q5k = QuantTensor::from_owned(q5k_data, vec![1, 512], QuantType::Q5K).unwrap();
 
-                let row = tensor.row_data(0);
-                let reference = dot_row_scalar(row, QuantType::Q4K, &input);
-                let integer = dot_row_avx2_q8k(row, QuantType::Q4K, &blocks)
-                    .expect("Q4_K integer kernel must exist on AVX2");
+            for tensor in [&q4, &q5k, &q6] {
+                for scale in [1.0f32, 0.001, 40.0] {
+                    let input: Vec<f32> = (0..512)
+                        .map(|i| (i as f32 * 0.023).cos() * scale)
+                        .collect();
+                    let mut blocks = Vec::new();
+                    quantize_activation_q8k(&input, &mut blocks);
 
-                // Q8_K activations carry ~7 bits of mantissa, so this compares
-                // against the f32 reference with a quantization-sized budget
-                // rather than a floating-point epsilon.
-                let magnitude: f32 = input.iter().map(|v| v.abs()).sum::<f32>() * 0.02;
-                let tolerance = magnitude.max(2e-3 * reference.abs().max(1.0));
-                assert!(
-                    (reference - integer).abs() <= tolerance,
-                    "scale={scale}: scalar={reference}, int8={integer}"
-                );
+                    let row = tensor.row_data(0);
+                    let reference = dot_row_scalar(row, tensor.quant_type, &input);
+                    let integer = dot_row_avx2_q8k(row, tensor.quant_type, &blocks)
+                        .expect("integer kernel must exist on AVX2");
+
+                    // Q8_K activations carry ~7 bits of mantissa, so this compares
+                    // against the f32 reference with a quantization-sized budget
+                    // rather than a floating-point epsilon.
+                    let magnitude: f32 = input.iter().map(|v| v.abs()).sum::<f32>() * 0.02;
+                    let tolerance = magnitude.max(2e-3 * reference.abs().max(1.0));
+                    assert!(
+                        (reference - integer).abs() <= tolerance,
+                        "{} scale={scale}: scalar={reference}, int8={integer}",
+                        tensor.quant_type.name()
+                    );
+                }
             }
         }
     }
@@ -1134,6 +1149,7 @@ mod tests {
 
         for tensor in [
             QuantTensor::quantize_q4k(&values, 2, 256).unwrap(),
+            QuantTensor::quantize_q6k(&values, 2, 256).unwrap(),
             QuantTensor::quantize_q8_0(&values, 2, 256).unwrap(),
             QuantTensor::quantize_q5_0(&values, 2, 256).unwrap(),
         ] {
@@ -1223,13 +1239,13 @@ mod tests {
             use crate::activation::quantize_activation_q8_32;
             use crate::simd::dot_row_avx2_q8_32;
 
-            // Q6_K has no integer kernel yet; it must report absence so the
+            // Q4_1 has no integer kernel yet; it must report absence so the
             // caller falls back rather than producing a wrong number.
             let values: Vec<f32> = (0..256).map(|i| (i as f32 * 0.03).sin()).collect();
             let tensor = QuantTensor::quantize_q6k(&values, 1, 256).unwrap();
             let mut blocks = Vec::new();
             quantize_activation_q8_32(&values, &mut blocks);
-            assert!(dot_row_avx2_q8_32(tensor.row_data(0), tensor.quant_type, &blocks).is_none());
+            assert!(dot_row_avx2_q8_32(tensor.row_data(0), QuantType::Q4_1, &blocks).is_none());
         }
     }
 

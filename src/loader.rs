@@ -216,14 +216,14 @@ impl SafetensorsLoader {
         };
         let lm_head = LinearLayer::new(lm_weight, None)?;
 
-        Ok(LlamaModel {
+        Ok(LlamaModel::new(
             embed_tokens,
             layers,
             norm,
             lm_head,
             config,
             backend,
-        })
+        ))
     }
 }
 
@@ -388,14 +388,14 @@ impl GgufLoader {
             embed_tokens.clone()
         };
         let lm_head = LinearLayer::new(lm_weight, None)?;
-        Ok(LlamaModel {
+        Ok(LlamaModel::new(
             embed_tokens,
             layers,
             norm,
             lm_head,
             config,
             backend,
-        })
+        ))
     }
 }
 

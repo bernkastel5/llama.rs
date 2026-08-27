@@ -126,10 +126,9 @@ pub enum ActivationLayout {
 
 pub fn activation_layout(ty: QuantType) -> ActivationLayout {
     match ty {
-        QuantType::Q4K => ActivationLayout::Q8K,
+        QuantType::Q4K | QuantType::Q5K | QuantType::Q6K => ActivationLayout::Q8K,
         QuantType::Q4_0 | QuantType::Q5_0 | QuantType::Q8_0 => ActivationLayout::Q8_32,
-        // Q4_1/Q5_1 carry a per-block offset, and Q5_K/Q6_K need their own
-        // kernels; all still take the f32 path.
+        // Q4_1/Q5_1 carry a per-block offset and still take the f32 path.
         _ => ActivationLayout::None,
     }
 }
@@ -204,13 +203,14 @@ mod tests {
     #[test]
     fn layout_selection_covers_the_supported_formats() {
         assert_eq!(activation_layout(QuantType::Q4K), ActivationLayout::Q8K);
+        assert_eq!(activation_layout(QuantType::Q5K), ActivationLayout::Q8K);
+        assert_eq!(activation_layout(QuantType::Q6K), ActivationLayout::Q8K);
         assert_eq!(activation_layout(QuantType::Q5_0), ActivationLayout::Q8_32);
         assert_eq!(activation_layout(QuantType::Q8_0), ActivationLayout::Q8_32);
         assert_eq!(activation_layout(QuantType::Q4_0), ActivationLayout::Q8_32);
         // Formats without an integer kernel must fall back, not silently differ.
-        assert_eq!(activation_layout(QuantType::Q5K), ActivationLayout::None);
-        assert_eq!(activation_layout(QuantType::Q6K), ActivationLayout::None);
         assert_eq!(activation_layout(QuantType::Q4_1), ActivationLayout::None);
+        assert_eq!(activation_layout(QuantType::Q5_1), ActivationLayout::None);
         assert_eq!(activation_layout(QuantType::F16), ActivationLayout::None);
     }
 

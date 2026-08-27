@@ -38,9 +38,7 @@ impl LinearLayer {
     ) -> Result<()> {
         self.weight.matvec_with(backend, input, output)?;
         if let Some(bias) = &self.bias {
-            for (value, bias) in output.iter_mut().zip(bias) {
-                *value += *bias;
-            }
+            crate::simd::vec_add_f32(output, bias);
         }
         Ok(())
     }
@@ -64,19 +62,14 @@ impl RMSNorm {
 
     pub fn forward(&self, hidden: &mut [f32]) -> Result<()> {
         ensure!(hidden.len() == self.weight.len(), "RMSNorm shape mismatch");
-        let mean_sq = hidden.iter().map(|x| x * x).sum::<f32>() / hidden.len() as f32;
-        let inv_rms = 1.0 / (mean_sq + self.eps).sqrt();
-        for (value, &weight) in hidden.iter_mut().zip(&self.weight) {
-            *value *= inv_rms * weight;
-        }
+        crate::simd::vec_rmsnorm(hidden, &self.weight, self.eps);
         Ok(())
     }
 }
 
-fn prepare_rope(pos: usize, head_dim: usize, rope_theta: f32, cos: &mut [f32], sin: &mut [f32]) {
-    for i in 0..head_dim / 2 {
-        let inv_freq = 1.0 / rope_theta.powf(2.0 * i as f32 / head_dim as f32);
-        let angle = pos as f32 * inv_freq;
+fn prepare_rope(pos: usize, inv_freq: &[f32], cos: &mut [f32], sin: &mut [f32]) {
+    for (i, &freq) in inv_freq.iter().enumerate() {
+        let angle = pos as f32 * freq;
         let (s, c) = angle.sin_cos();
         cos[i] = c;
         sin[i] = s;
@@ -85,13 +78,7 @@ fn prepare_rope(pos: usize, head_dim: usize, rope_theta: f32, cos: &mut [f32], s
 
 /// Qwen2 uses the non-interleaved (split-half) RoPE convention.
 fn apply_rope_inplace(x: &mut [f32], cos: &[f32], sin: &[f32]) {
-    let half = x.len() / 2;
-    for i in 0..half {
-        let real = x[i];
-        let imag = x[i + half];
-        x[i] = real * cos[i] - imag * sin[i];
-        x[i + half] = real * sin[i] + imag * cos[i];
-    }
+    crate::simd::vec_rope_inplace(x, cos, sin);
 }
 
 #[derive(Debug, Clone)]
@@ -115,12 +102,38 @@ pub struct Qwen2Model {
     pub lm_head: LinearLayer,
     pub config: LlamaConfig,
     pub backend: Arc<dyn KernelBackend>,
+    pub inv_freq: Vec<f32>,
 }
 
 /// Backward-compatible name retained for the original public API.
 pub type LlamaModel = Qwen2Model;
 
 impl Qwen2Model {
+    pub fn new(
+        embed_tokens: QuantTensor,
+        layers: Vec<TransformerBlock>,
+        norm: RMSNorm,
+        lm_head: LinearLayer,
+        config: LlamaConfig,
+        backend: Arc<dyn KernelBackend>,
+    ) -> Self {
+        let head_dim = config.head_dim();
+        let half_dim = head_dim / 2;
+        let mut inv_freq = Vec::with_capacity(half_dim);
+        for i in 0..half_dim {
+            inv_freq.push(1.0 / config.rope_theta.powf(2.0 * i as f32 / head_dim as f32));
+        }
+        Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            config,
+            backend,
+            inv_freq,
+        }
+    }
+
     /// Compatibility wrapper that computes vocabulary logits.
     pub fn forward(
         &self,
@@ -161,8 +174,7 @@ impl Qwen2Model {
         let attention_scale = 1.0 / (head_dim as f32).sqrt();
         prepare_rope(
             pos,
-            head_dim,
-            cfg.rope_theta,
+            &self.inv_freq,
             &mut buffers.rope_cos,
             &mut buffers.rope_sin,
         );
@@ -214,8 +226,7 @@ impl Qwen2Model {
                 for (past_pos, score) in scores.iter_mut().enumerate() {
                     let key_start = past_pos * kv_width + kv_head * head_dim;
                     let key = &kv_cache.k_cache[layer_idx][key_start..key_start + head_dim];
-                    *score =
-                        q_head.iter().zip(key).map(|(q, k)| q * k).sum::<f32>() * attention_scale;
+                    *score = crate::simd::vec_dot_f32(q_head, key) * attention_scale;
                 }
                 softmax_inplace(scores);
 
@@ -224,18 +235,14 @@ impl Qwen2Model {
                 for (past_pos, &weight) in scores.iter().enumerate() {
                     let value_start = past_pos * kv_width + kv_head * head_dim;
                     let value = &kv_cache.v_cache[layer_idx][value_start..value_start + head_dim];
-                    for (out, &v) in head_out.iter_mut().zip(value) {
-                        *out += weight * v;
-                    }
+                    crate::simd::vec_mad_f32(head_out, value, weight);
                 }
             }
 
             block
                 .self_attn_o
                 .forward(backend, &buffers.attention, &mut buffers.projection)?;
-            for i in 0..hidden {
-                buffers.residual[i] += buffers.projection[i];
-            }
+            crate::simd::vec_add_f32(&mut buffers.residual, &buffers.projection);
 
             // Post-attention norm and SwiGLU: silu(gate) * up.
             buffers.hidden_states.copy_from_slice(&buffers.residual);
@@ -248,16 +255,11 @@ impl Qwen2Model {
             block
                 .mlp_up
                 .forward(backend, &buffers.hidden_states, &mut buffers.up)?;
-            for i in 0..cfg.intermediate_size {
-                let gate = buffers.gate[i];
-                buffers.gate[i] = (gate / (1.0 + (-gate).exp())) * buffers.up[i];
-            }
+            crate::simd::vec_swiglu(&mut buffers.gate, &buffers.up);
             block
                 .mlp_down
                 .forward(backend, &buffers.gate, &mut buffers.down)?;
-            for i in 0..hidden {
-                buffers.residual[i] += buffers.down[i];
-            }
+            crate::simd::vec_add_f32(&mut buffers.residual, &buffers.down);
         }
 
         if logits == LogitsMode::Compute {

@@ -5,11 +5,11 @@ use crate::activation::{
 use crate::quant::{dot_row_for_kernel, QuantTensor};
 use crate::simd::{dot_row_avx2_q8_32, dot_row_avx2_q8k};
 use anyhow::{bail, ensure, Result};
-use rayon::prelude::*;
-use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::cell::RefCell;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 /// Runtime-selectable CPU kernel family. `Auto` never enables instructions that
 /// were not detected on the current CPU.
@@ -102,6 +102,188 @@ pub trait KernelBackend: Send + Sync + fmt::Debug {
     fn matvec(&self, weight: &QuantTensor, input: &[f32], output: &mut [f32]) -> Result<()>;
 }
 
+type RunnerFn = unsafe fn(*const (), usize, usize);
+
+struct PoolShared {
+    generation: AtomicUsize,
+    done: AtomicUsize,
+    shutdown: AtomicBool,
+    parked: AtomicUsize,
+    lock: Mutex<()>,
+    cvar: Condvar,
+    task_ptr: AtomicPtr<()>,
+    task_runner: AtomicPtr<()>,
+}
+
+/// Low-latency persistent thread pool with atomic spin-barrier.
+///
+/// Avoids the ~50 µs per-matvec fork-join overhead of generic task pools.
+/// Worker threads stay alive for the backend lifetime, spin on an atomic
+/// generation counter during tight token generation loops, and fall back to
+/// sleeping when idle.
+pub struct PersistentPool {
+    threads: usize,
+    shared: Arc<PoolShared>,
+    workers: Mutex<Vec<JoinHandle<()>>>,
+    execution_lock: Mutex<()>,
+}
+
+fn worker_loop(thread_idx: usize, num_threads: usize, shared: Arc<PoolShared>) {
+    let mut last_gen = 0;
+    loop {
+        let mut spins = 0;
+        loop {
+            if shared.shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            let current_gen = shared.generation.load(Ordering::Acquire);
+            if current_gen != last_gen {
+                last_gen = current_gen;
+                break;
+            }
+            if spins < 2000 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else if spins < 10000 {
+                thread::yield_now();
+                spins += 1;
+            } else {
+                let mut guard = shared.lock.lock().unwrap();
+                while shared.generation.load(Ordering::Acquire) == last_gen
+                    && !shared.shutdown.load(Ordering::Acquire)
+                {
+                    shared.parked.fetch_add(1, Ordering::Release);
+                    guard = shared.cvar.wait(guard).unwrap();
+                    shared.parked.fetch_sub(1, Ordering::Release);
+                }
+            }
+        }
+
+        if shared.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        let task_ptr = shared.task_ptr.load(Ordering::Acquire);
+        let runner_ptr = shared.task_runner.load(Ordering::Acquire);
+        if !task_ptr.is_null() && !runner_ptr.is_null() {
+            let runner: RunnerFn = unsafe { std::mem::transmute(runner_ptr) };
+            unsafe {
+                runner(task_ptr as *const (), thread_idx, num_threads);
+            }
+        }
+
+        shared.done.fetch_add(1, Ordering::Release);
+    }
+}
+
+impl PersistentPool {
+    pub fn new(threads: usize) -> Self {
+        let shared = Arc::new(PoolShared {
+            generation: AtomicUsize::new(0),
+            done: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+            parked: AtomicUsize::new(0),
+            lock: Mutex::new(()),
+            cvar: Condvar::new(),
+            task_ptr: AtomicPtr::new(std::ptr::null_mut()),
+            task_runner: AtomicPtr::new(std::ptr::null_mut()),
+        });
+
+        let mut workers = Vec::with_capacity(threads.saturating_sub(1));
+        for thread_idx in 1..threads {
+            let shared_clone = Arc::clone(&shared);
+            let handle = thread::Builder::new()
+                .name(format!("llama-rs-worker-{thread_idx}"))
+                .spawn(move || {
+                    worker_loop(thread_idx, threads, shared_clone);
+                })
+                .expect("failed to spawn worker thread");
+            workers.push(handle);
+        }
+
+        Self {
+            threads,
+            shared,
+            workers: Mutex::new(workers),
+            execution_lock: Mutex::new(()),
+        }
+    }
+
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    pub fn execute<F>(&self, f: F)
+    where
+        F: Fn(usize, usize) + Sync,
+    {
+        if self.threads <= 1 {
+            f(0, 1);
+            return;
+        }
+
+        let _exec_guard = self.execution_lock.lock().unwrap();
+
+        unsafe fn runner_trampoline<F: Fn(usize, usize) + Sync>(
+            data: *const (),
+            thread_idx: usize,
+            num_threads: usize,
+        ) {
+            let closure = &*(data as *const F);
+            closure(thread_idx, num_threads);
+        }
+
+        let task_data = &f as *const F as *mut ();
+        let runner_fn: RunnerFn = runner_trampoline::<F>;
+        let runner_ptr = runner_fn as usize as *mut ();
+
+        self.shared.task_ptr.store(task_data, Ordering::Release);
+        self.shared.task_runner.store(runner_ptr, Ordering::Release);
+        self.shared.done.store(0, Ordering::Release);
+
+        self.shared.generation.fetch_add(1, Ordering::Release);
+
+        if self.shared.parked.load(Ordering::Acquire) > 0 {
+            let _guard = self.shared.lock.lock().unwrap();
+            self.shared.cvar.notify_all();
+        }
+
+        // Main thread executes partition 0
+        f(0, self.threads);
+
+        // Spin-wait for all worker threads
+        let target = self.threads - 1;
+        let mut spins = 0;
+        while self.shared.done.load(Ordering::Acquire) < target {
+            if spins < 10000 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                thread::yield_now();
+            }
+        }
+
+        self.shared.task_ptr.store(std::ptr::null_mut(), Ordering::Release);
+        self.shared.task_runner.store(std::ptr::null_mut(), Ordering::Release);
+    }
+}
+
+impl Drop for PersistentPool {
+    fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.shared.generation.fetch_add(1, Ordering::Release);
+        {
+            let _guard = self.shared.lock.lock().unwrap();
+            self.shared.cvar.notify_all();
+        }
+        if let Ok(mut workers) = self.workers.lock() {
+            for handle in workers.drain(..) {
+                let _ = handle.join();
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CpuBackend {
     inner: Arc<CpuBackendInner>,
@@ -112,7 +294,7 @@ struct CpuBackendInner {
     threads: usize,
     parallel_threshold: usize,
     integer_activations: bool,
-    pool: ThreadPool,
+    pool: PersistentPool,
 }
 
 impl fmt::Debug for CpuBackend {
@@ -138,10 +320,7 @@ impl CpuBackend {
         };
         ensure!(threads > 0, "backend thread count must be positive");
         let kind = select_kernel(config.kernel)?;
-        let pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|index| format!("llama-rs-{index}"))
-            .build()?;
+        let pool = PersistentPool::new(threads);
         Ok(Self {
             inner: Arc::new(CpuBackendInner {
                 kind,
@@ -172,18 +351,29 @@ impl CpuBackend {
         }
     }
 
-    /// Shared row loop, so the serial and parallel policies live in one place
-    /// instead of being duplicated per kernel.
+    /// Shared row loop using the persistent thread pool with contiguous chunk partitioning.
     fn run_rows<F>(&self, parallel: bool, output: &mut [f32], compute: F)
     where
         F: Fn(usize) -> f32 + Sync + Send,
     {
         if parallel {
-            self.inner.pool.install(|| {
-                output
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(row, out)| *out = compute(row));
+            let num_rows = output.len();
+            let out_ptr = output.as_mut_ptr() as usize;
+            self.inner.pool.execute(|thread_idx, num_threads| {
+                let start = thread_idx * num_rows / num_threads;
+                let end = ((thread_idx + 1) * num_rows / num_threads).min(num_rows);
+                if start < end {
+                    let out = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            (out_ptr as *mut f32).add(start),
+                            end - start,
+                        )
+                    };
+                    for (offset, dst) in out.iter_mut().enumerate() {
+                        let row = start + offset;
+                        *dst = compute(row);
+                    }
+                }
             });
         } else {
             for (row, out) in output.iter_mut().enumerate() {
@@ -248,17 +438,9 @@ impl KernelBackend for CpuBackend {
             ActivationLayout::None => {}
         }
 
-        if parallel {
-            self.inner.pool.install(|| {
-                output.par_iter_mut().enumerate().for_each(|(row, out)| {
-                    *out = dot_row_for_kernel(kind, weight.row_data(row), weight.quant_type, input)
-                });
-            });
-        } else {
-            for (row, out) in output.iter_mut().enumerate() {
-                *out = dot_row_for_kernel(kind, weight.row_data(row), weight.quant_type, input);
-            }
-        }
+        self.run_rows(parallel, output, |row| {
+            dot_row_for_kernel(kind, weight.row_data(row), weight.quant_type, input)
+        });
         Ok(())
     }
 }
@@ -348,5 +530,109 @@ fn neon_available() -> bool {
     #[cfg(not(target_arch = "aarch64"))]
     {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persistent_pool_executes_parallel_work() {
+        let pool = PersistentPool::new(4);
+        let mut values = vec![0u32; 1000];
+        let val_ptr = values.as_mut_ptr() as usize;
+
+        pool.execute(|thread_idx, num_threads| {
+            let start = thread_idx * 1000 / num_threads;
+            let end = ((thread_idx + 1) * 1000 / num_threads).min(1000);
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut((val_ptr as *mut u32).add(start), end - start)
+            };
+            for (i, v) in slice.iter_mut().enumerate() {
+                *v = (start + i) as u32;
+            }
+        });
+
+        for (i, &v) in values.iter().enumerate() {
+            assert_eq!(v, i as u32);
+        }
+    }
+
+    #[test]
+    fn persistent_pool_single_thread_fallback() {
+        let pool = PersistentPool::new(1);
+        let mut executed = false;
+        pool.execute(|tid, nt| {
+            assert_eq!(tid, 0);
+            assert_eq!(nt, 1);
+            executed = true;
+        });
+        assert!(executed);
+    }
+
+    #[test]
+    fn persistent_pool_multiple_sequential_rounds() {
+        let pool = PersistentPool::new(2);
+        let mut counter = 0u64;
+        let cnt_ptr = &mut counter as *mut u64 as usize;
+
+        for _ in 0..1000 {
+            pool.execute(|tid, _nt| {
+                if tid == 0 {
+                    unsafe { *(cnt_ptr as *mut u64) += 1 };
+                }
+            });
+        }
+        assert_eq!(counter, 1000);
+    }
+
+    #[test]
+    fn persistent_pool_parks_and_wakes() {
+        let pool = PersistentPool::new(2);
+        // Let workers spin down and park
+        thread::sleep(std::time::Duration::from_millis(20));
+
+        let mut done = false;
+        pool.execute(|_tid, _nt| {
+            done = true;
+        });
+        assert!(done);
+    }
+
+    #[test]
+    fn cpu_backend_multithreaded_matches_single_threaded() {
+        let config_serial = BackendConfig {
+            threads: 1,
+            integer_activations: false,
+            ..BackendConfig::default()
+        };
+        let config_parallel = BackendConfig {
+            threads: 4,
+            parallel_threshold: 0, // force parallel
+            integer_activations: false,
+            ..BackendConfig::default()
+        };
+
+        let backend_serial = CpuBackend::new(&config_serial).unwrap();
+        let backend_parallel = CpuBackend::new(&config_parallel).unwrap();
+
+        let rows = 64;
+        let cols = 256;
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.05).sin()).collect();
+        let f32_data: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let tensor = QuantTensor::quantize_q4k(&f32_data, &[rows, cols]).unwrap();
+
+        let mut out_serial = vec![0.0f32; rows];
+        let mut out_parallel = vec![0.0f32; rows];
+
+        backend_serial.matvec(&tensor, &input, &mut out_serial).unwrap();
+        backend_parallel.matvec(&tensor, &input, &mut out_parallel).unwrap();
+
+        for (s, p) in out_serial.iter().zip(&out_parallel) {
+            assert!((s - p).abs() < 1e-5, "serial {s} vs parallel {p}");
+        }
     }
 }

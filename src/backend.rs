@@ -562,13 +562,13 @@ mod tests {
     #[test]
     fn persistent_pool_single_thread_fallback() {
         let pool = PersistentPool::new(1);
-        let mut executed = false;
+        let executed = std::sync::atomic::AtomicBool::new(false);
         pool.execute(|tid, nt| {
             assert_eq!(tid, 0);
             assert_eq!(nt, 1);
-            executed = true;
+            executed.store(true, Ordering::SeqCst);
         });
-        assert!(executed);
+        assert!(executed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -593,11 +593,11 @@ mod tests {
         // Let workers spin down and park
         thread::sleep(std::time::Duration::from_millis(20));
 
-        let mut done = false;
+        let done = std::sync::atomic::AtomicBool::new(false);
         pool.execute(|_tid, _nt| {
-            done = true;
+            done.store(true, Ordering::SeqCst);
         });
-        assert!(done);
+        assert!(done.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -623,7 +623,7 @@ mod tests {
         let f32_data: Vec<f32> = (0..rows * cols)
             .map(|i| (i as f32 * 0.03).cos())
             .collect();
-        let tensor = QuantTensor::quantize_q4k(&f32_data, &[rows, cols]).unwrap();
+        let tensor = QuantTensor::quantize_q4k(&f32_data, rows, cols).unwrap();
 
         let mut out_serial = vec![0.0f32; rows];
         let mut out_parallel = vec![0.0f32; rows];

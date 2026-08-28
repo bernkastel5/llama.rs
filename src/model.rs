@@ -165,7 +165,6 @@ impl Qwen2Model {
             kv_cache.max_seq_len
         );
 
-        let hidden = cfg.hidden_size;
         let head_dim = cfg.head_dim();
         let num_heads = cfg.num_attention_heads;
         let num_kv_heads = cfg.num_key_value_heads;

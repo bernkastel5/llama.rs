@@ -451,8 +451,12 @@ mod x86 {
                         _mm256_and_si256(_mm256_srli_epi16(ql_val, 4), low_mask)
                     };
 
-                    let shift = quarter * 2;
-                    let high_shifted = _mm256_srli_epi16(qh_val, shift as i32);
+                    let high_shifted = match quarter {
+                        0 => qh_val,
+                        1 => _mm256_srli_epi16(qh_val, 2),
+                        2 => _mm256_srli_epi16(qh_val, 4),
+                        _ => _mm256_srli_epi16(qh_val, 6),
+                    };
                     let high = _mm256_and_si256(high_shifted, high_mask);
 
                     let q = _mm256_or_si256(low, _mm256_slli_epi16(high, 4));

@@ -1,3 +1,4 @@
+use crate::activation::QuantizedActivation;
 use crate::config::LlamaConfig;
 use anyhow::{ensure, Result};
 
@@ -70,6 +71,8 @@ pub struct InferenceBuffers {
     pub up: Vec<f32>,
     pub down: Vec<f32>,
     pub scores: Vec<f32>,
+    /// Pre-allocated reusable quantized activation scratch.
+    pub quant_act: QuantizedActivation,
     /// RoPE values for the current position, computed once and reused by every layer.
     pub rope_cos: Vec<f32>,
     pub rope_sin: Vec<f32>,
@@ -81,6 +84,7 @@ impl InferenceBuffers {
         let hidden = config.hidden_size;
         let kv = config.kv_width();
         let intermediate = config.intermediate_size;
+        let num_heads = config.num_attention_heads;
         Self {
             hidden_states: vec![0.0; hidden],
             residual: vec![0.0; hidden],
@@ -92,7 +96,8 @@ impl InferenceBuffers {
             gate: vec![0.0; intermediate],
             up: vec![0.0; intermediate],
             down: vec![0.0; hidden],
-            scores: vec![0.0; max_seq_len],
+            scores: vec![0.0; max_seq_len * num_heads],
+            quant_act: QuantizedActivation::new(),
             rope_cos: vec![0.0; config.head_dim() / 2],
             rope_sin: vec![0.0; config.head_dim() / 2],
             logits: vec![0.0; config.vocab_size],

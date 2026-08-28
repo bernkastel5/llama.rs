@@ -43,6 +43,21 @@ impl LinearLayer {
         Ok(())
     }
 
+    pub fn forward_quant(
+        &self,
+        backend: &dyn KernelBackend,
+        input: &[f32],
+        quant_act: &crate::activation::QuantizedActivation,
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.weight
+            .matvec_quantized_with(backend, input, quant_act, output)?;
+        if let Some(bias) = &self.bias {
+            crate::simd::vec_add_f32(output, bias);
+        }
+        Ok(())
+    }
+
     pub fn forward_batch(
         &self,
         backend: &dyn KernelBackend,
@@ -208,15 +223,29 @@ impl Qwen2Model {
             buffers.hidden_states.copy_from_slice(&buffers.residual);
             block.input_layernorm.forward(&mut buffers.hidden_states)?;
 
-            block
-                .self_attn_q
-                .forward(backend, &buffers.hidden_states, &mut buffers.q)?;
-            block
-                .self_attn_k
-                .forward(backend, &buffers.hidden_states, &mut buffers.k)?;
-            block
-                .self_attn_v
-                .forward(backend, &buffers.hidden_states, &mut buffers.v)?;
+            // Quantize hidden_states ONCE for self_attn_q, self_attn_k, self_attn_v
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.self_attn_q.weight, &buffers.hidden_states);
+
+            block.self_attn_q.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.q,
+            )?;
+            block.self_attn_k.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.k,
+            )?;
+            block.self_attn_v.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.v,
+            )?;
 
             for head in 0..num_heads {
                 let start = head * head_dim;
@@ -238,31 +267,82 @@ impl Qwen2Model {
             kv_cache.update(layer_idx, pos, &buffers.k, &buffers.v)?;
             buffers.attention.fill(0.0);
 
-            for head in 0..num_heads {
-                let kv_head = head / groups;
-                let q_start = head * head_dim;
-                let q_head = &buffers.q[q_start..q_start + head_dim];
-                let scores = &mut buffers.scores[..=pos];
+            let max_seq_len = kv_cache.max_seq_len;
+            let q_slice = &buffers.q;
+            let k_slice = &kv_cache.k_cache[layer_idx];
+            let v_slice = &kv_cache.v_cache[layer_idx];
+            let attn_ptr = buffers.attention.as_mut_ptr() as usize;
+            let scores_ptr = buffers.scores.as_mut_ptr() as usize;
 
-                for (past_pos, score) in scores.iter_mut().enumerate() {
-                    let key_start = past_pos * kv_width + kv_head * head_dim;
-                    let key = &kv_cache.k_cache[layer_idx][key_start..key_start + head_dim];
-                    *score = crate::simd::vec_dot_f32(q_head, key) * attention_scale;
-                }
-                softmax_inplace(scores);
+            if backend.threads() > 1 && num_heads >= 2 {
+                backend.execute(&|thread_idx, num_threads| {
+                    let start_head = thread_idx * num_heads / num_threads;
+                    let end_head = ((thread_idx + 1) * num_heads / num_threads).min(num_heads);
+                    for head in start_head..end_head {
+                        let kv_head = head / groups;
+                        let q_start = head * head_dim;
+                        let q_head = &q_slice[q_start..q_start + head_dim];
 
-                let out_start = head * head_dim;
-                let head_out = &mut buffers.attention[out_start..out_start + head_dim];
-                for (past_pos, &weight) in scores.iter().enumerate() {
-                    let value_start = past_pos * kv_width + kv_head * head_dim;
-                    let value = &kv_cache.v_cache[layer_idx][value_start..value_start + head_dim];
-                    crate::simd::vec_mad_f32(head_out, value, weight);
+                        let scores = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (scores_ptr as *mut f32).add(head * max_seq_len),
+                                pos + 1,
+                            )
+                        };
+
+                        for (past_pos, score) in scores.iter_mut().enumerate() {
+                            let key_start = past_pos * kv_width + kv_head * head_dim;
+                            let key = &k_slice[key_start..key_start + head_dim];
+                            *score = crate::simd::vec_dot_f32(q_head, key) * attention_scale;
+                        }
+                        softmax_inplace(scores);
+
+                        let head_out = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (attn_ptr as *mut f32).add(head * head_dim),
+                                head_dim,
+                            )
+                        };
+                        for (past_pos, &weight) in scores.iter().enumerate() {
+                            let value_start = past_pos * kv_width + kv_head * head_dim;
+                            let value = &v_slice[value_start..value_start + head_dim];
+                            crate::simd::vec_mad_f32(head_out, value, weight);
+                        }
+                    }
+                });
+            } else {
+                for head in 0..num_heads {
+                    let kv_head = head / groups;
+                    let q_start = head * head_dim;
+                    let q_head = &q_slice[q_start..q_start + head_dim];
+                    let scores =
+                        &mut buffers.scores[head * max_seq_len..head * max_seq_len + pos + 1];
+
+                    for (past_pos, score) in scores.iter_mut().enumerate() {
+                        let key_start = past_pos * kv_width + kv_head * head_dim;
+                        let key = &k_slice[key_start..key_start + head_dim];
+                        *score = crate::simd::vec_dot_f32(q_head, key) * attention_scale;
+                    }
+                    softmax_inplace(scores);
+
+                    let head_out = &mut buffers.attention[head * head_dim..(head + 1) * head_dim];
+                    for (past_pos, &weight) in scores.iter().enumerate() {
+                        let value_start = past_pos * kv_width + kv_head * head_dim;
+                        let value = &v_slice[value_start..value_start + head_dim];
+                        crate::simd::vec_mad_f32(head_out, value, weight);
+                    }
                 }
             }
 
-            block
-                .self_attn_o
-                .forward(backend, &buffers.attention, &mut buffers.projection)?;
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.self_attn_o.weight, &buffers.attention);
+            block.self_attn_o.forward_quant(
+                backend,
+                &buffers.attention,
+                &buffers.quant_act,
+                &mut buffers.projection,
+            )?;
             crate::simd::vec_add_f32(&mut buffers.residual, &buffers.projection);
 
             // Post-attention norm and SwiGLU: silu(gate) * up.
@@ -270,24 +350,50 @@ impl Qwen2Model {
             block
                 .post_attention_layernorm
                 .forward(&mut buffers.hidden_states)?;
-            block
-                .mlp_gate
-                .forward(backend, &buffers.hidden_states, &mut buffers.gate)?;
-            block
-                .mlp_up
-                .forward(backend, &buffers.hidden_states, &mut buffers.up)?;
+
+            // Quantize hidden_states ONCE for mlp_gate and mlp_up
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.mlp_gate.weight, &buffers.hidden_states);
+
+            block.mlp_gate.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.gate,
+            )?;
+            block.mlp_up.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.up,
+            )?;
             crate::simd::vec_swiglu(&mut buffers.gate, &buffers.up);
-            block
-                .mlp_down
-                .forward(backend, &buffers.gate, &mut buffers.down)?;
+
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.mlp_down.weight, &buffers.gate);
+            block.mlp_down.forward_quant(
+                backend,
+                &buffers.gate,
+                &buffers.quant_act,
+                &mut buffers.down,
+            )?;
             crate::simd::vec_add_f32(&mut buffers.residual, &buffers.down);
         }
 
         if logits == LogitsMode::Compute {
             buffers.hidden_states.copy_from_slice(&buffers.residual);
             self.norm.forward(&mut buffers.hidden_states)?;
-            self.lm_head
-                .forward(backend, &buffers.hidden_states, &mut buffers.logits)?;
+            buffers
+                .quant_act
+                .quantize_for_tensor(&self.lm_head.weight, &buffers.hidden_states);
+            self.lm_head.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.logits,
+            )?;
         }
         Ok(())
     }
@@ -532,8 +638,9 @@ fn softmax_inplace(values: &mut [f32]) {
         sum += *value;
     }
     if sum.is_finite() && sum > 0.0 {
+        let inv_sum = 1.0 / sum;
         for value in values {
-            *value /= sum;
+            *value *= inv_sum;
         }
     } else {
         let uniform = 1.0 / values.len() as f32;

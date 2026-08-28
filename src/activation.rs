@@ -114,9 +114,10 @@ pub fn quantize_activation_q8_32(input: &[f32], out: &mut Vec<BlockQ8_32>) {
 /// This is the single place that decides whether a format has an integer path.
 /// Adding a format means adding a kernel and one arm here; the backend, the
 /// architecture layer and the engine are untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivationLayout {
     /// No integer kernel; use the existing f32 path.
+    #[default]
     None,
     /// 256-value super-blocks, for the K-quants.
     Q8K,
@@ -130,6 +131,55 @@ pub fn activation_layout(ty: QuantType) -> ActivationLayout {
         QuantType::Q4_0 | QuantType::Q5_0 | QuantType::Q8_0 => ActivationLayout::Q8_32,
         // Q4_1/Q5_1 carry a per-block offset and still take the f32 path.
         _ => ActivationLayout::None,
+    }
+}
+
+/// Pre-quantized activation container for eliminating redundant quantizations
+/// across multiple linear projections (e.g. Q/K/V sharing the same hidden_states,
+/// and Gate/Up sharing the same hidden_states).
+#[derive(Clone, Debug, Default)]
+pub struct QuantizedActivation {
+    pub q8k: Vec<BlockQ8K>,
+    pub q8_32: Vec<BlockQ8_32>,
+    pub layout: ActivationLayout,
+}
+
+impl QuantizedActivation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn quantize(&mut self, input: &[f32], target_layout: ActivationLayout) {
+        self.layout = target_layout;
+        match target_layout {
+            ActivationLayout::Q8K => {
+                quantize_activation_q8k(input, &mut self.q8k);
+            }
+            ActivationLayout::Q8_32 => {
+                quantize_activation_q8_32(input, &mut self.q8_32);
+            }
+            ActivationLayout::None => {
+                self.q8k.clear();
+                self.q8_32.clear();
+            }
+        }
+    }
+
+    pub fn quantize_for_type(&mut self, ty: QuantType, input: &[f32]) {
+        let target_layout = activation_layout(ty);
+        self.quantize(input, target_layout);
+    }
+
+    pub fn quantize_for_tensor(&mut self, tensor: &crate::quant::QuantTensor, input: &[f32]) {
+        self.quantize_for_type(tensor.quant_type, input);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self.layout {
+            ActivationLayout::Q8K => self.q8k.is_empty(),
+            ActivationLayout::Q8_32 => self.q8_32.is_empty(),
+            ActivationLayout::None => true,
+        }
     }
 }
 
@@ -220,5 +270,26 @@ mod tests {
         quantize_activation_q8_32(&vec![1.0; 64], &mut blocks);
         quantize_activation_q8_32(&vec![1.0; 32], &mut blocks);
         assert_eq!(blocks.len(), 1, "buffer must be cleared between calls");
+    }
+
+    #[test]
+    fn quantized_activation_struct_works() {
+        let input: Vec<f32> = (0..256).map(|i| (i as f32 * 0.05).sin()).collect();
+        let mut act = QuantizedActivation::new();
+        assert!(act.is_empty());
+
+        act.quantize(&input, ActivationLayout::Q8K);
+        assert_eq!(act.layout, ActivationLayout::Q8K);
+        assert_eq!(act.q8k.len(), 1);
+        assert!(!act.is_empty());
+
+        act.quantize(&input, ActivationLayout::Q8_32);
+        assert_eq!(act.layout, ActivationLayout::Q8_32);
+        assert_eq!(act.q8_32.len(), 8);
+        assert!(!act.is_empty());
+
+        act.quantize(&input, ActivationLayout::None);
+        assert_eq!(act.layout, ActivationLayout::None);
+        assert!(act.is_empty());
     }
 }

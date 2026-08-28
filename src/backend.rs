@@ -504,18 +504,13 @@ impl KernelBackend for CpuBackend {
                 let ty = weight.quant_type;
                 let num_blocks = cols / QK_K;
                 let mut scratch = take_q8k_scratch();
-                scratch.resize(
-                    batch_size * num_blocks,
-                    BlockQ8K {
-                        d: 0.0,
-                        qs: [0; QK_K],
-                        bsums: [0; 16],
-                    },
-                );
+                scratch.clear();
+                scratch.reserve(batch_size * num_blocks);
+                let mut single_scratch = Vec::with_capacity(num_blocks);
                 for b in 0..batch_size {
                     let in_b = &inputs[b * cols..(b + 1) * cols];
-                    let slot = &mut scratch[b * num_blocks..(b + 1) * num_blocks];
-                    quantize_activation_q8k(in_b, slot);
+                    quantize_activation_q8k(in_b, &mut single_scratch);
+                    scratch.extend_from_slice(&single_scratch);
                 }
                 let activation: &[BlockQ8K] = &scratch;
 
@@ -558,17 +553,13 @@ impl KernelBackend for CpuBackend {
                 let ty = weight.quant_type;
                 let num_blocks = cols / 32;
                 let mut scratch = take_q8_32_scratch();
-                scratch.resize(
-                    batch_size * num_blocks,
-                    BlockQ8_32 {
-                        d: 0.0,
-                        qs: [0; 32],
-                    },
-                );
+                scratch.clear();
+                scratch.reserve(batch_size * num_blocks);
+                let mut single_scratch = Vec::with_capacity(num_blocks);
                 for b in 0..batch_size {
                     let in_b = &inputs[b * cols..(b + 1) * cols];
-                    let slot = &mut scratch[b * num_blocks..(b + 1) * num_blocks];
-                    quantize_activation_q8_32(in_b, slot);
+                    quantize_activation_q8_32(in_b, &mut single_scratch);
+                    scratch.extend_from_slice(&single_scratch);
                 }
                 let activation: &[BlockQ8_32] = &scratch;
 

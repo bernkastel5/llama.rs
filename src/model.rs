@@ -238,25 +238,70 @@ impl Qwen2Model {
             kv_cache.update(layer_idx, pos, &buffers.k, &buffers.v)?;
             buffers.attention.fill(0.0);
 
-            for head in 0..num_heads {
-                let kv_head = head / groups;
-                let q_start = head * head_dim;
-                let q_head = &buffers.q[q_start..q_start + head_dim];
-                let scores = &mut buffers.scores[..=pos];
+            let max_seq_len = kv_cache.max_seq_len;
+            let q_slice = &buffers.q;
+            let k_slice = &kv_cache.k_cache[layer_idx];
+            let v_slice = &kv_cache.v_cache[layer_idx];
+            let attn_ptr = buffers.attention.as_mut_ptr() as usize;
+            let scores_ptr = buffers.scores.as_mut_ptr() as usize;
 
-                for (past_pos, score) in scores.iter_mut().enumerate() {
-                    let key_start = past_pos * kv_width + kv_head * head_dim;
-                    let key = &kv_cache.k_cache[layer_idx][key_start..key_start + head_dim];
-                    *score = crate::simd::vec_dot_f32(q_head, key) * attention_scale;
-                }
-                softmax_inplace(scores);
+            if backend.threads() > 1 && num_heads >= 2 {
+                backend.execute(&|thread_idx, num_threads| {
+                    let start_head = thread_idx * num_heads / num_threads;
+                    let end_head = ((thread_idx + 1) * num_heads / num_threads).min(num_heads);
+                    for head in start_head..end_head {
+                        let kv_head = head / groups;
+                        let q_start = head * head_dim;
+                        let q_head = &q_slice[q_start..q_start + head_dim];
 
-                let out_start = head * head_dim;
-                let head_out = &mut buffers.attention[out_start..out_start + head_dim];
-                for (past_pos, &weight) in scores.iter().enumerate() {
-                    let value_start = past_pos * kv_width + kv_head * head_dim;
-                    let value = &kv_cache.v_cache[layer_idx][value_start..value_start + head_dim];
-                    crate::simd::vec_mad_f32(head_out, value, weight);
+                        let scores = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (scores_ptr as *mut f32).add(head * max_seq_len),
+                                pos + 1,
+                            )
+                        };
+
+                        for (past_pos, score) in scores.iter_mut().enumerate() {
+                            let key_start = past_pos * kv_width + kv_head * head_dim;
+                            let key = &k_slice[key_start..key_start + head_dim];
+                            *score = crate::simd::vec_dot_f32(q_head, key) * attention_scale;
+                        }
+                        softmax_inplace(scores);
+
+                        let head_out = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                (attn_ptr as *mut f32).add(head * head_dim),
+                                head_dim,
+                            )
+                        };
+                        for (past_pos, &weight) in scores.iter().enumerate() {
+                            let value_start = past_pos * kv_width + kv_head * head_dim;
+                            let value = &v_slice[value_start..value_start + head_dim];
+                            crate::simd::vec_mad_f32(head_out, value, weight);
+                        }
+                    }
+                });
+            } else {
+                for head in 0..num_heads {
+                    let kv_head = head / groups;
+                    let q_start = head * head_dim;
+                    let q_head = &q_slice[q_start..q_start + head_dim];
+                    let scores =
+                        &mut buffers.scores[head * max_seq_len..head * max_seq_len + pos + 1];
+
+                    for (past_pos, score) in scores.iter_mut().enumerate() {
+                        let key_start = past_pos * kv_width + kv_head * head_dim;
+                        let key = &k_slice[key_start..key_start + head_dim];
+                        *score = crate::simd::vec_dot_f32(q_head, key) * attention_scale;
+                    }
+                    softmax_inplace(scores);
+
+                    let head_out = &mut buffers.attention[head * head_dim..(head + 1) * head_dim];
+                    for (past_pos, &weight) in scores.iter().enumerate() {
+                        let value_start = past_pos * kv_width + kv_head * head_dim;
+                        let value = &v_slice[value_start..value_start + head_dim];
+                        crate::simd::vec_mad_f32(head_out, value, weight);
+                    }
                 }
             }
 
@@ -532,8 +577,9 @@ fn softmax_inplace(values: &mut [f32]) {
         sum += *value;
     }
     if sum.is_finite() && sum > 0.0 {
+        let inv_sum = 1.0 / sum;
         for value in values {
-            *value /= sum;
+            *value *= inv_sum;
         }
     } else {
         let uniform = 1.0 / values.len() as f32;

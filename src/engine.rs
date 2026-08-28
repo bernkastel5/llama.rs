@@ -4,6 +4,7 @@ use crate::cache::{InferenceBuffers, KVCache};
 use crate::loader::{LoadOptions, ModelLoader};
 use anyhow::{bail, ensure, Context, Result};
 use rand::Rng;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -44,7 +45,7 @@ pub struct InferenceEngine {
     pub repetition_penalty: f32,
     pub max_repeat_window: usize,
     pub eos_token_ids: Vec<u32>,
-    recent_tokens: Vec<u32>,
+    recent_tokens: VecDeque<u32>,
     candidates: Vec<(usize, f32)>,
     seen_tokens: Vec<bool>,
 }
@@ -81,7 +82,7 @@ impl InferenceEngine {
             repetition_penalty: options.repetition_penalty,
             max_repeat_window: options.repeat_last_n,
             eos_token_ids,
-            recent_tokens: Vec::with_capacity(options.repeat_last_n + 1),
+            recent_tokens: VecDeque::with_capacity(options.repeat_last_n + 1),
             candidates: Vec::with_capacity(vocab_size),
             seen_tokens: vec![false; vocab_size],
         })
@@ -244,13 +245,47 @@ impl InferenceEngine {
         if self.max_repeat_window == 0 {
             return;
         }
-        self.recent_tokens.push(token);
+        self.recent_tokens.push_back(token);
         if self.recent_tokens.len() > self.max_repeat_window {
-            self.recent_tokens.remove(0);
+            self.recent_tokens.pop_front();
         }
     }
 
     fn sample_current_logits(&mut self) -> u32 {
+        let temperature = self.temperature;
+        if temperature <= 0.0 {
+            if self.repetition_penalty == 1.0 || self.recent_tokens.is_empty() {
+                return self.argmax_current_logits();
+            }
+            for &token in &self.recent_tokens {
+                if let Some(value) = self.seen_tokens.get_mut(token as usize) {
+                    *value = true;
+                }
+            }
+            let mut best_token = 0;
+            let mut best_val = f32::NEG_INFINITY;
+            for (token, &raw) in self.buffers.logits.iter().enumerate() {
+                let mut val = raw;
+                if self.seen_tokens[token] {
+                    val = if val > 0.0 {
+                        val / self.repetition_penalty
+                    } else {
+                        val * self.repetition_penalty
+                    };
+                }
+                if val > best_val {
+                    best_val = val;
+                    best_token = token;
+                }
+            }
+            for &token in &self.recent_tokens {
+                if let Some(value) = self.seen_tokens.get_mut(token as usize) {
+                    *value = false;
+                }
+            }
+            return best_token as u32;
+        }
+
         for &token in &self.recent_tokens {
             if let Some(value) = self.seen_tokens.get_mut(token as usize) {
                 *value = true;
@@ -258,7 +293,6 @@ impl InferenceEngine {
         }
 
         self.candidates.clear();
-        let temperature = self.temperature;
         for (token, &raw) in self.buffers.logits.iter().enumerate() {
             let mut value = raw;
             if self.repetition_penalty != 1.0 && self.seen_tokens[token] {
@@ -268,9 +302,7 @@ impl InferenceEngine {
                     value * self.repetition_penalty
                 };
             }
-            if temperature > 0.0 {
-                value /= temperature;
-            }
+            value /= temperature;
             if !value.is_finite() {
                 value = f32::NEG_INFINITY;
             }
@@ -282,13 +314,12 @@ impl InferenceEngine {
             }
         }
 
-        self.candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        if temperature <= 0.0 {
-            return self.candidates[0].0 as u32;
-        }
         if self.top_k > 0 && self.top_k < self.candidates.len() {
-            self.candidates.truncate(self.top_k);
+            let k = self.top_k;
+            self.candidates.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
+            self.candidates.truncate(k);
         }
+        self.candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
         let max = self.candidates[0].1;
         let mut sum = 0.0f32;
@@ -299,8 +330,9 @@ impl InferenceEngine {
         if !sum.is_finite() || sum <= 0.0 {
             return self.candidates[0].0 as u32;
         }
+        let inv_sum = 1.0 / sum;
         for (_, probability) in &mut self.candidates {
-            *probability /= sum;
+            *probability *= inv_sum;
         }
 
         let mut cumulative = 0.0f32;

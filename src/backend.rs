@@ -128,6 +128,10 @@ pub trait KernelBackend: Send + Sync + fmt::Debug {
         }
         Ok(())
     }
+
+    fn execute(&self, f: &dyn Fn(usize, usize) + Sync) {
+        f(0, 1);
+    }
 }
 
 type RunnerFn = unsafe fn(*const (), usize, usize);
@@ -424,6 +428,10 @@ impl KernelBackend for CpuBackend {
 
     fn threads(&self) -> usize {
         self.inner.threads
+    }
+
+    fn execute(&self, f: &dyn Fn(usize, usize) + Sync) {
+        self.inner.pool.execute(|t, n| f(t, n));
     }
 
     fn matvec(&self, weight: &QuantTensor, input: &[f32], output: &mut [f32]) -> Result<()> {

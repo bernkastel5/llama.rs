@@ -1,9 +1,11 @@
 use crate::activation::{
     activation_layout, quantize_activation_q8_32, quantize_activation_q8k, ActivationLayout,
-    BlockQ8K, BlockQ8_32, QK_K,
+    BlockQ8K, BlockQ8_32, QuantizedActivation, QK_K,
 };
 use crate::quant::{dot_row_for_kernel, QuantTensor};
-use crate::simd::{dot_row_avx2_q8_32, dot_row_avx2_q8k};
+use crate::simd::{
+    dot_row_2rows_avx2_q8_32, dot_row_2rows_avx2_q8k, dot_row_avx2_q8_32, dot_row_avx2_q8k,
+};
 use anyhow::{bail, ensure, Result};
 use std::cell::RefCell;
 use std::fmt;
@@ -131,6 +133,16 @@ pub trait KernelBackend: Send + Sync + fmt::Debug {
 
     fn execute(&self, f: &(dyn Fn(usize, usize) + Sync)) {
         f(0, 1);
+    }
+
+    fn matvec_quantized(
+        &self,
+        weight: &QuantTensor,
+        input: &[f32],
+        _quant_act: &QuantizedActivation,
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.matvec(weight, input, output)
     }
 }
 
@@ -413,6 +425,140 @@ impl CpuBackend {
             }
         }
     }
+
+    fn matvec_quantized_q8k(
+        &self,
+        weight: &QuantTensor,
+        activation: &[BlockQ8K],
+        parallel: bool,
+        output: &mut [f32],
+    ) {
+        let ty = weight.quant_type;
+        let rows = weight.rows();
+        let num_pairs = rows / 2;
+        let remainder = rows % 2;
+
+        if parallel {
+            let out_ptr = output.as_mut_ptr() as usize;
+            self.inner.pool.execute(|thread_idx, num_threads| {
+                let start_pair = thread_idx * num_pairs / num_threads;
+                let end_pair = ((thread_idx + 1) * num_pairs / num_threads).min(num_pairs);
+                for p in start_pair..end_pair {
+                    let r0 = p * 2;
+                    let r1 = r0 + 1;
+                    let data0 = weight.row_data(r0);
+                    let data1 = weight.row_data(r1);
+                    if let Some((v0, v1)) = dot_row_2rows_avx2_q8k(data0, data1, ty, activation) {
+                        unsafe {
+                            *((out_ptr as *mut f32).add(r0)) = v0;
+                            *((out_ptr as *mut f32).add(r1)) = v1;
+                        }
+                    } else {
+                        let v0 = dot_row_avx2_q8k(data0, ty, activation).unwrap_or(0.0);
+                        let v1 = dot_row_avx2_q8k(data1, ty, activation).unwrap_or(0.0);
+                        unsafe {
+                            *((out_ptr as *mut f32).add(r0)) = v0;
+                            *((out_ptr as *mut f32).add(r1)) = v1;
+                        }
+                    }
+                }
+                if remainder != 0 && thread_idx == num_threads - 1 {
+                    let last_row = rows - 1;
+                    let data = weight.row_data(last_row);
+                    let v = dot_row_avx2_q8k(data, ty, activation).unwrap_or(0.0);
+                    unsafe {
+                        *((out_ptr as *mut f32).add(last_row)) = v;
+                    }
+                }
+            });
+        } else {
+            for p in 0..num_pairs {
+                let r0 = p * 2;
+                let r1 = r0 + 1;
+                let data0 = weight.row_data(r0);
+                let data1 = weight.row_data(r1);
+                if let Some((v0, v1)) = dot_row_2rows_avx2_q8k(data0, data1, ty, activation) {
+                    output[r0] = v0;
+                    output[r1] = v1;
+                } else {
+                    output[r0] = dot_row_avx2_q8k(data0, ty, activation).unwrap_or(0.0);
+                    output[r1] = dot_row_avx2_q8k(data1, ty, activation).unwrap_or(0.0);
+                }
+            }
+            if remainder != 0 {
+                let last_row = rows - 1;
+                let data = weight.row_data(last_row);
+                output[last_row] = dot_row_avx2_q8k(data, ty, activation).unwrap_or(0.0);
+            }
+        }
+    }
+
+    fn matvec_quantized_q8_32(
+        &self,
+        weight: &QuantTensor,
+        activation: &[BlockQ8_32],
+        parallel: bool,
+        output: &mut [f32],
+    ) {
+        let ty = weight.quant_type;
+        let rows = weight.rows();
+        let num_pairs = rows / 2;
+        let remainder = rows % 2;
+
+        if parallel {
+            let out_ptr = output.as_mut_ptr() as usize;
+            self.inner.pool.execute(|thread_idx, num_threads| {
+                let start_pair = thread_idx * num_pairs / num_threads;
+                let end_pair = ((thread_idx + 1) * num_pairs / num_threads).min(num_pairs);
+                for p in start_pair..end_pair {
+                    let r0 = p * 2;
+                    let r1 = r0 + 1;
+                    let data0 = weight.row_data(r0);
+                    let data1 = weight.row_data(r1);
+                    if let Some((v0, v1)) = dot_row_2rows_avx2_q8_32(data0, data1, ty, activation) {
+                        unsafe {
+                            *((out_ptr as *mut f32).add(r0)) = v0;
+                            *((out_ptr as *mut f32).add(r1)) = v1;
+                        }
+                    } else {
+                        let v0 = dot_row_avx2_q8_32(data0, ty, activation).unwrap_or(0.0);
+                        let v1 = dot_row_avx2_q8_32(data1, ty, activation).unwrap_or(0.0);
+                        unsafe {
+                            *((out_ptr as *mut f32).add(r0)) = v0;
+                            *((out_ptr as *mut f32).add(r1)) = v1;
+                        }
+                    }
+                }
+                if remainder != 0 && thread_idx == num_threads - 1 {
+                    let last_row = rows - 1;
+                    let data = weight.row_data(last_row);
+                    let v = dot_row_avx2_q8_32(data, ty, activation).unwrap_or(0.0);
+                    unsafe {
+                        *((out_ptr as *mut f32).add(last_row)) = v;
+                    }
+                }
+            });
+        } else {
+            for p in 0..num_pairs {
+                let r0 = p * 2;
+                let r1 = r0 + 1;
+                let data0 = weight.row_data(r0);
+                let data1 = weight.row_data(r1);
+                if let Some((v0, v1)) = dot_row_2rows_avx2_q8_32(data0, data1, ty, activation) {
+                    output[r0] = v0;
+                    output[r1] = v1;
+                } else {
+                    output[r0] = dot_row_avx2_q8_32(data0, ty, activation).unwrap_or(0.0);
+                    output[r1] = dot_row_avx2_q8_32(data1, ty, activation).unwrap_or(0.0);
+                }
+            }
+            if remainder != 0 {
+                let last_row = rows - 1;
+                let data = weight.row_data(last_row);
+                output[last_row] = dot_row_avx2_q8_32(data, ty, activation).unwrap_or(0.0);
+            }
+        }
+    }
 }
 
 impl Default for CpuBackend {
@@ -446,32 +592,54 @@ impl KernelBackend for CpuBackend {
         // many rows, so it happens once per matrix here rather than per row.
         match self.integer_layout(kind, weight) {
             ActivationLayout::Q8K => {
-                let ty = weight.quant_type;
                 let mut scratch = take_q8k_scratch();
                 quantize_activation_q8k(input, &mut scratch);
-                let activation: &[BlockQ8K] = &scratch;
-                self.run_rows(parallel, output, |row| {
-                    let data = weight.row_data(row);
-                    dot_row_avx2_q8k(data, ty, activation)
-                        .unwrap_or_else(|| dot_row_for_kernel(kind, data, ty, input))
-                });
+                self.matvec_quantized_q8k(weight, &scratch, parallel, output);
                 restore_q8k_scratch(scratch);
                 return Ok(());
             }
             ActivationLayout::Q8_32 => {
-                let ty = weight.quant_type;
                 let mut scratch = take_q8_32_scratch();
                 quantize_activation_q8_32(input, &mut scratch);
-                let activation: &[BlockQ8_32] = &scratch;
-                self.run_rows(parallel, output, |row| {
-                    let data = weight.row_data(row);
-                    dot_row_avx2_q8_32(data, ty, activation)
-                        .unwrap_or_else(|| dot_row_for_kernel(kind, data, ty, input))
-                });
+                self.matvec_quantized_q8_32(weight, &scratch, parallel, output);
                 restore_q8_32_scratch(scratch);
                 return Ok(());
             }
             ActivationLayout::None => {}
+        }
+
+        self.run_rows(parallel, output, |row| {
+            dot_row_for_kernel(kind, weight.row_data(row), weight.quant_type, input)
+        });
+        Ok(())
+    }
+
+    fn matvec_quantized(
+        &self,
+        weight: &QuantTensor,
+        input: &[f32],
+        quant_act: &QuantizedActivation,
+        output: &mut [f32],
+    ) -> Result<()> {
+        weight.validate_matvec(input, output)?;
+        let work = weight.rows().saturating_mul(weight.cols());
+        let kind = self.inner.kind;
+        let parallel = self.inner.threads > 1
+            && weight.rows() >= self.inner.threads * 2
+            && work >= self.inner.parallel_threshold;
+
+        if self.inner.integer_activations && kind == KernelKind::Avx2 {
+            match quant_act.layout {
+                ActivationLayout::Q8K if weight.cols() % QK_K == 0 => {
+                    self.matvec_quantized_q8k(weight, &quant_act.q8k, parallel, output);
+                    return Ok(());
+                }
+                ActivationLayout::Q8_32 if weight.cols() % 32 == 0 => {
+                    self.matvec_quantized_q8_32(weight, &quant_act.q8_32, parallel, output);
+                    return Ok(());
+                }
+                _ => {}
+            }
         }
 
         self.run_rows(parallel, output, |row| {
@@ -868,6 +1036,43 @@ mod tests {
                     "batch token {b}: single {single} vs batched {batched}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn test_cpu_backend_matvec_quantized_matches_matvec() {
+        let config = BackendConfig {
+            threads: 2,
+            parallel_threshold: 0,
+            integer_activations: true,
+            ..BackendConfig::default()
+        };
+        let backend = CpuBackend::new(&config).unwrap();
+
+        let rows = 64;
+        let cols = 256;
+        let input: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.05).sin()).collect();
+        let f32_data: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let tensor = QuantTensor::quantize_q4k(&f32_data, rows, cols).unwrap();
+
+        let mut quant_act = QuantizedActivation::new();
+        quant_act.quantize_for_tensor(&tensor, &input);
+
+        let mut out_direct = vec![0.0f32; rows];
+        let mut out_quant = vec![0.0f32; rows];
+
+        backend.matvec(&tensor, &input, &mut out_direct).unwrap();
+        backend
+            .matvec_quantized(&tensor, &input, &quant_act, &mut out_quant)
+            .unwrap();
+
+        for (d, q) in out_direct.iter().zip(&out_quant) {
+            assert!(
+                (d - q).abs() < 1e-5,
+                "direct {d} vs quantized-cached {q}"
+            );
         }
     }
 }

@@ -43,6 +43,21 @@ impl LinearLayer {
         Ok(())
     }
 
+    pub fn forward_quant(
+        &self,
+        backend: &dyn KernelBackend,
+        input: &[f32],
+        quant_act: &crate::activation::QuantizedActivation,
+        output: &mut [f32],
+    ) -> Result<()> {
+        self.weight
+            .matvec_quantized_with(backend, input, quant_act, output)?;
+        if let Some(bias) = &self.bias {
+            crate::simd::vec_add_f32(output, bias);
+        }
+        Ok(())
+    }
+
     pub fn forward_batch(
         &self,
         backend: &dyn KernelBackend,
@@ -208,15 +223,29 @@ impl Qwen2Model {
             buffers.hidden_states.copy_from_slice(&buffers.residual);
             block.input_layernorm.forward(&mut buffers.hidden_states)?;
 
-            block
-                .self_attn_q
-                .forward(backend, &buffers.hidden_states, &mut buffers.q)?;
-            block
-                .self_attn_k
-                .forward(backend, &buffers.hidden_states, &mut buffers.k)?;
-            block
-                .self_attn_v
-                .forward(backend, &buffers.hidden_states, &mut buffers.v)?;
+            // Quantize hidden_states ONCE for self_attn_q, self_attn_k, self_attn_v
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.self_attn_q.weight, &buffers.hidden_states);
+
+            block.self_attn_q.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.q,
+            )?;
+            block.self_attn_k.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.k,
+            )?;
+            block.self_attn_v.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.v,
+            )?;
 
             for head in 0..num_heads {
                 let start = head * head_dim;
@@ -305,9 +334,15 @@ impl Qwen2Model {
                 }
             }
 
-            block
-                .self_attn_o
-                .forward(backend, &buffers.attention, &mut buffers.projection)?;
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.self_attn_o.weight, &buffers.attention);
+            block.self_attn_o.forward_quant(
+                backend,
+                &buffers.attention,
+                &buffers.quant_act,
+                &mut buffers.projection,
+            )?;
             crate::simd::vec_add_f32(&mut buffers.residual, &buffers.projection);
 
             // Post-attention norm and SwiGLU: silu(gate) * up.
@@ -315,24 +350,50 @@ impl Qwen2Model {
             block
                 .post_attention_layernorm
                 .forward(&mut buffers.hidden_states)?;
-            block
-                .mlp_gate
-                .forward(backend, &buffers.hidden_states, &mut buffers.gate)?;
-            block
-                .mlp_up
-                .forward(backend, &buffers.hidden_states, &mut buffers.up)?;
+
+            // Quantize hidden_states ONCE for mlp_gate and mlp_up
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.mlp_gate.weight, &buffers.hidden_states);
+
+            block.mlp_gate.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.gate,
+            )?;
+            block.mlp_up.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.up,
+            )?;
             crate::simd::vec_swiglu(&mut buffers.gate, &buffers.up);
-            block
-                .mlp_down
-                .forward(backend, &buffers.gate, &mut buffers.down)?;
+
+            buffers
+                .quant_act
+                .quantize_for_tensor(&block.mlp_down.weight, &buffers.gate);
+            block.mlp_down.forward_quant(
+                backend,
+                &buffers.gate,
+                &buffers.quant_act,
+                &mut buffers.down,
+            )?;
             crate::simd::vec_add_f32(&mut buffers.residual, &buffers.down);
         }
 
         if logits == LogitsMode::Compute {
             buffers.hidden_states.copy_from_slice(&buffers.residual);
             self.norm.forward(&mut buffers.hidden_states)?;
-            self.lm_head
-                .forward(backend, &buffers.hidden_states, &mut buffers.logits)?;
+            buffers
+                .quant_act
+                .quantize_for_tensor(&self.lm_head.weight, &buffers.hidden_states);
+            self.lm_head.forward_quant(
+                backend,
+                &buffers.hidden_states,
+                &buffers.quant_act,
+                &mut buffers.logits,
+            )?;
         }
         Ok(())
     }

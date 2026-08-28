@@ -309,6 +309,16 @@ impl QuantTensor {
         backend.matvec(self, input, output)
     }
 
+    pub fn matvec_quantized_with(
+        &self,
+        backend: &dyn KernelBackend,
+        input: &[f32],
+        quant_act: &crate::activation::QuantizedActivation,
+        output: &mut [f32],
+    ) -> Result<()> {
+        backend.matvec_quantized(self, input, quant_act, output)
+    }
+
     pub fn matvec_batch_with(
         &self,
         backend: &dyn KernelBackend,

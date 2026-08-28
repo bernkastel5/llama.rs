@@ -81,6 +81,10 @@ impl QuantType {
             Self::Q6K => "Q6_K",
         }
     }
+
+    pub fn row_bytes(self, cols: usize) -> usize {
+        cols / self.block_size() * self.type_size()
+    }
 }
 
 #[derive(Debug, Clone)]

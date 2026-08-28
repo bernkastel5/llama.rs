@@ -1537,7 +1537,7 @@ pub(crate) fn dot_row_neon(row: &[u8], ty: QuantType, input: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activation::{quantize_q8_0, quantize_q8_k};
+    use crate::activation::{quantize_activation_q8_32, quantize_activation_q8k};
 
     #[test]
     fn test_dot_f16_and_bf16_avx2() {
@@ -1569,7 +1569,8 @@ mod tests {
     fn test_2rows_q8_32_matches_1row() {
         let n = 64;
         let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.25 - 5.0).collect();
-        let act = quantize_q8_0(&input);
+        let mut act = Vec::new();
+        quantize_activation_q8_32(&input, &mut act);
 
         // Test Q8_0, Q5_0, Q4_0
         let types = [QuantType::Q8_0, QuantType::Q5_0, QuantType::Q4_0];
@@ -1600,7 +1601,8 @@ mod tests {
     fn test_2rows_q8k_matches_1row() {
         let n = 256;
         let input: Vec<f32> = (0..n).map(|i| (i as f32) * 0.1 - 10.0).collect();
-        let act = quantize_q8_k(&input);
+        let mut act = Vec::new();
+        quantize_activation_q8k(&input, &mut act);
 
         // Test Q4_K, Q5_K, Q6_K
         let types = [QuantType::Q4K, QuantType::Q5K, QuantType::Q6K];

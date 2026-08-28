@@ -114,9 +114,10 @@ pub fn quantize_activation_q8_32(input: &[f32], out: &mut Vec<BlockQ8_32>) {
 /// This is the single place that decides whether a format has an integer path.
 /// Adding a format means adding a kernel and one arm here; the backend, the
 /// architecture layer and the engine are untouched.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ActivationLayout {
     /// No integer kernel; use the existing f32 path.
+    #[default]
     None,
     /// 256-value super-blocks, for the K-quants.
     Q8K,

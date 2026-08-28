@@ -100,6 +100,34 @@ pub trait KernelBackend: Send + Sync + fmt::Debug {
     fn name(&self) -> &'static str;
     fn threads(&self) -> usize;
     fn matvec(&self, weight: &QuantTensor, input: &[f32], output: &mut [f32]) -> Result<()>;
+
+    fn matvec_batch(
+        &self,
+        weight: &QuantTensor,
+        inputs: &[f32],
+        outputs: &mut [f32],
+        batch_size: usize,
+    ) -> Result<()> {
+        if batch_size == 1 {
+            return self.matvec(weight, inputs, outputs);
+        }
+        let in_len = weight.cols();
+        let out_len = weight.rows();
+        ensure!(
+            inputs.len() == batch_size * in_len,
+            "inputs length mismatch for batch size {batch_size}"
+        );
+        ensure!(
+            outputs.len() == batch_size * out_len,
+            "outputs length mismatch for batch size {batch_size}"
+        );
+        for b in 0..batch_size {
+            let in_b = &inputs[b * in_len..(b + 1) * in_len];
+            let out_b = &mut outputs[b * out_len..(b + 1) * out_len];
+            self.matvec(weight, in_b, out_b)?;
+        }
+        Ok(())
+    }
 }
 
 type RunnerFn = unsafe fn(*const (), usize, usize);
@@ -443,6 +471,173 @@ impl KernelBackend for CpuBackend {
         });
         Ok(())
     }
+
+    fn matvec_batch(
+        &self,
+        weight: &QuantTensor,
+        inputs: &[f32],
+        outputs: &mut [f32],
+        batch_size: usize,
+    ) -> Result<()> {
+        if batch_size <= 1 {
+            return self.matvec(weight, inputs, outputs);
+        }
+        let rows = weight.rows();
+        let cols = weight.cols();
+        ensure!(
+            inputs.len() == batch_size * cols,
+            "inputs length mismatch for batch size {batch_size}"
+        );
+        ensure!(
+            outputs.len() == batch_size * rows,
+            "outputs length mismatch for batch size {batch_size}"
+        );
+
+        let work = rows.saturating_mul(cols).saturating_mul(batch_size);
+        let kind = self.inner.kind;
+        let parallel = self.inner.threads > 1
+            && rows >= self.inner.threads * 2
+            && work >= self.inner.parallel_threshold;
+
+        match self.integer_layout(kind, weight) {
+            ActivationLayout::Q8K => {
+                let ty = weight.quant_type;
+                let num_blocks = cols / QK_K;
+                let mut scratch = take_q8k_scratch();
+                scratch.resize(
+                    batch_size * num_blocks,
+                    BlockQ8K {
+                        d: 0.0,
+                        qs: [0; QK_K],
+                        bsums: [0; 16],
+                    },
+                );
+                for b in 0..batch_size {
+                    let in_b = &inputs[b * cols..(b + 1) * cols];
+                    let slot = &mut scratch[b * num_blocks..(b + 1) * num_blocks];
+                    quantize_activation_q8k(in_b, slot);
+                }
+                let activation: &[BlockQ8K] = &scratch;
+
+                if parallel {
+                    let out_ptr = outputs.as_mut_ptr() as usize;
+                    self.inner.pool.execute(|thread_idx, num_threads| {
+                        let start = thread_idx * rows / num_threads;
+                        let end = ((thread_idx + 1) * rows / num_threads).min(rows);
+                        for row in start..end {
+                            let data = weight.row_data(row);
+                            for b in 0..batch_size {
+                                let act_b = &activation[b * num_blocks..(b + 1) * num_blocks];
+                                let val = dot_row_avx2_q8k(data, ty, act_b).unwrap_or_else(|| {
+                                    let in_b = &inputs[b * cols..(b + 1) * cols];
+                                    dot_row_for_kernel(kind, data, ty, in_b)
+                                });
+                                unsafe {
+                                    *((out_ptr as *mut f32).add(b * rows + row)) = val;
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    for row in 0..rows {
+                        let data = weight.row_data(row);
+                        for b in 0..batch_size {
+                            let act_b = &activation[b * num_blocks..(b + 1) * num_blocks];
+                            let val = dot_row_avx2_q8k(data, ty, act_b).unwrap_or_else(|| {
+                                let in_b = &inputs[b * cols..(b + 1) * cols];
+                                dot_row_for_kernel(kind, data, ty, in_b)
+                            });
+                            outputs[b * rows + row] = val;
+                        }
+                    }
+                }
+                restore_q8k_scratch(scratch);
+                return Ok(());
+            }
+            ActivationLayout::Q8_32 => {
+                let ty = weight.quant_type;
+                let num_blocks = cols / 32;
+                let mut scratch = take_q8_32_scratch();
+                scratch.resize(
+                    batch_size * num_blocks,
+                    BlockQ8_32 {
+                        d: 0.0,
+                        qs: [0; 32],
+                    },
+                );
+                for b in 0..batch_size {
+                    let in_b = &inputs[b * cols..(b + 1) * cols];
+                    let slot = &mut scratch[b * num_blocks..(b + 1) * num_blocks];
+                    quantize_activation_q8_32(in_b, slot);
+                }
+                let activation: &[BlockQ8_32] = &scratch;
+
+                if parallel {
+                    let out_ptr = outputs.as_mut_ptr() as usize;
+                    self.inner.pool.execute(|thread_idx, num_threads| {
+                        let start = thread_idx * rows / num_threads;
+                        let end = ((thread_idx + 1) * rows / num_threads).min(rows);
+                        for row in start..end {
+                            let data = weight.row_data(row);
+                            for b in 0..batch_size {
+                                let act_b = &activation[b * num_blocks..(b + 1) * num_blocks];
+                                let val = dot_row_avx2_q8_32(data, ty, act_b).unwrap_or_else(|| {
+                                    let in_b = &inputs[b * cols..(b + 1) * cols];
+                                    dot_row_for_kernel(kind, data, ty, in_b)
+                                });
+                                unsafe {
+                                    *((out_ptr as *mut f32).add(b * rows + row)) = val;
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    for row in 0..rows {
+                        let data = weight.row_data(row);
+                        for b in 0..batch_size {
+                            let act_b = &activation[b * num_blocks..(b + 1) * num_blocks];
+                            let val = dot_row_avx2_q8_32(data, ty, act_b).unwrap_or_else(|| {
+                                let in_b = &inputs[b * cols..(b + 1) * cols];
+                                dot_row_for_kernel(kind, data, ty, in_b)
+                            });
+                            outputs[b * rows + row] = val;
+                        }
+                    }
+                }
+                restore_q8_32_scratch(scratch);
+                return Ok(());
+            }
+            ActivationLayout::None => {}
+        }
+
+        if parallel {
+            let out_ptr = outputs.as_mut_ptr() as usize;
+            self.inner.pool.execute(|thread_idx, num_threads| {
+                let start = thread_idx * rows / num_threads;
+                let end = ((thread_idx + 1) * rows / num_threads).min(rows);
+                for row in start..end {
+                    let data = weight.row_data(row);
+                    for b in 0..batch_size {
+                        let in_b = &inputs[b * cols..(b + 1) * cols];
+                        let val = dot_row_for_kernel(kind, data, weight.quant_type, in_b);
+                        unsafe {
+                            *((out_ptr as *mut f32).add(b * rows + row)) = val;
+                        }
+                    }
+                }
+            });
+        } else {
+            for row in 0..rows {
+                let data = weight.row_data(row);
+                for b in 0..batch_size {
+                    let in_b = &inputs[b * cols..(b + 1) * cols];
+                    outputs[b * rows + row] =
+                        dot_row_for_kernel(kind, data, weight.quant_type, in_b);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 thread_local! {
@@ -633,6 +828,47 @@ mod tests {
 
         for (s, p) in out_serial.iter().zip(&out_parallel) {
             assert!((s - p).abs() < 1e-5, "serial {s} vs parallel {p}");
+        }
+    }
+
+    #[test]
+    fn cpu_backend_matvec_batch_matches_single_matvec() {
+        let config = BackendConfig {
+            threads: 2,
+            parallel_threshold: 0,
+            integer_activations: true,
+            ..BackendConfig::default()
+        };
+        let backend = CpuBackend::new(&config).unwrap();
+
+        let rows = 32;
+        let cols = 256;
+        let batch_size = 4;
+        let mut inputs = vec![0.0f32; batch_size * cols];
+        for (i, v) in inputs.iter_mut().enumerate() {
+            *v = (i as f32 * 0.02).sin();
+        }
+        let f32_data: Vec<f32> = (0..rows * cols)
+            .map(|i| (i as f32 * 0.03).cos())
+            .collect();
+        let tensor = QuantTensor::quantize_q4k(&f32_data, rows, cols).unwrap();
+
+        let mut out_batch = vec![0.0f32; batch_size * rows];
+        backend
+            .matvec_batch(&tensor, &inputs, &mut out_batch, batch_size)
+            .unwrap();
+
+        for b in 0..batch_size {
+            let in_b = &inputs[b * cols..(b + 1) * cols];
+            let mut out_single = vec![0.0f32; rows];
+            backend.matvec(&tensor, in_b, &mut out_single).unwrap();
+            let batch_slice = &out_batch[b * rows..(b + 1) * rows];
+            for (single, batched) in out_single.iter().zip(batch_slice) {
+                assert!(
+                    (single - batched).abs() < 1e-4,
+                    "batch token {b}: single {single} vs batched {batched}"
+                );
+            }
         }
     }
 }

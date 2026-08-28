@@ -309,6 +309,16 @@ impl QuantTensor {
         backend.matvec(self, input, output)
     }
 
+    pub fn matvec_batch_with(
+        &self,
+        backend: &dyn KernelBackend,
+        inputs: &[f32],
+        outputs: &mut [f32],
+        batch_size: usize,
+    ) -> Result<()> {
+        backend.matvec_batch(self, inputs, outputs, batch_size)
+    }
+
     pub(crate) fn validate_matvec(&self, input: &[f32], output: &[f32]) -> Result<()> {
         ensure!(self.shape.len() == 2, "matvec requires a 2D tensor");
         ensure!(

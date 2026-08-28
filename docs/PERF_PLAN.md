@@ -508,6 +508,22 @@ f32-произведение, молча стал приближением: те
 * Добавлены тесты в `src/simd.rs` (`test_dot_f16_and_bf16_avx2`, `test_2rows_q8_32_matches_1row`, `test_2rows_q8k_matches_1row`).
 * Добавлен тест в `src/backend.rs` (`test_cpu_backend_matvec_quantized_matches_matvec`).
 
+### 12.5. Результаты замеров на устройстве пользователя после Шага 6 (Qwen2.5-0.5B-Instruct-Q4_K_M, 4 потока)
+* **Длинная генерация (366 токенов)**: **46.06 tok/s** decode (падение скорости с ростом контекста отсутствует).
+* **Короткая генерация (28–30 токенов)**: **45.82 – 47.79 tok/s** decode.
+* **Prefill**: **54.23 – 55.89 tok/s**.
+
+### 12.6. Сводная динамика производительности проекта
+
+| Этап оптимизации | Decode (ток/с) | Prefill (ток/с) | Прирост к baseline | Статус цели (≥80% llama.cpp ~40–45 tok/s) |
+|---|---|---|---|---|
+| **0. Исходное состояние (Baseline)** | ~15.0 tok/s | ~30.0 tok/s | 1.00× (база) | 30–35% |
+| **Шаги 1–3 (int8 ядра + PersistentPool)** | 35.69 tok/s | ~30.0 tok/s | 2.38× | ~70% |
+| **Шаг 4 (Batched Prefill + LTO/native)** | 28.68–31.49 tok/s | **57.99 tok/s** | 2.00× (decode) / 1.93× (prefill) | ~60% decode / 100%+ prefill |
+| **Шаг 5 (Параллельный Attention + $O(V)$ Sampling)** | 34.56–36.30 tok/s | 55.39–57.37 tok/s | 2.42× (decode) / 1.91× (prefill) | ~75% |
+| **Шаг 6 (2-Row Register Blocking + Zero-Redundancy Reuse)** | **46.06–47.79 tok/s** | **54.23–55.89 tok/s** | **3.10×–3.19× (decode)** | **100%+ (Цель полностью достигнута)** |
+
+
 
 
 
